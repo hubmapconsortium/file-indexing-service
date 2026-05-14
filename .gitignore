@@ -1,0 +1,48 @@
+# SQLite database files
+*.db*
+
+*.manifest
+
+# Generated BUILD file
+BUILD
+
+# VS Code files
+**/.vscode/
+*.code-workspace
+
+#eclipse project files
+.project
+.pydevproject
+
+# EMACS backup files
+*~
+
+# Configuration
+config.ini
+
+# log files in any path
+**/*.log
+
+# Rotated log files
+**/*.log*
+
+.idea
+
+*.DS_Store
+
+**/__pycache__/
+
+# Ignore docker env file
+docker/.env
+
+# Docker copied files and directories
+docker/file-indexing-service/src
+docker/file-indexing-service/VERSION
+docker/file-indexing-service/BUILD
+
+# Portal cache
+src/hubmap_translation/addl_index_transformations/portal/cache/*.jsonld
+
+
+# python virtual environments
+**/.venv
