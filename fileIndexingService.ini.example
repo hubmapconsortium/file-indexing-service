@@ -1,0 +1,14 @@
+[SlackNotificationSettings]
+# Bot token from the HuBMAP Slack app (xoxb-...)
+SLACK_CHANNEL_TOKEN=
+SLACK_SUPPORTED_CHANNELS=['log-processing']
+SLACK_NOTIFICATION_CHANNEL=log-processing
+SLACK_MAX_MSG_LENGTH=2048
+SLACK_BAD_NEWS_EMOJI=:bangbang:
+SLACK_GOOD_NEWS_EMOJI=:trophy:
+SLACK_NEUTRAL_INFO_EMOJI=:bell:
+; Value in form of a Python dict containing developer names and
+; associated Slack User IDs (not User Names.)
+; e.g. {'Fname Lname': 'U99TUVWX9YZ'}
+SLACK_USER_ID_MENTIONS_ON_ERROR={}
+SLACK_USER_ID_MENTIONS_ON_SUCCESS={}

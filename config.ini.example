@@ -1,8 +1,15 @@
 [Local]
-DATABASE_FILEPATH = /home/karl/PycharmProjects/devops/file-indexing-service/indexed_files_dev.db
+DATABASE_FILEPATH = /home/karl/PycharmProjects/file-indexing-service/indexed_files_dev.db
 LOG_ID = dev
 LOG_LEVEL = ERROR  # Options: DEBUG, INFO, WARNING, ERROR
-INDEX_PATHS = /hive/hubmap/data
+INDEX_PATHS =   /hive/hubmap-localhost/data/public
+                , /hive/hubmap-localhost/data/consortium
+
+[AWSSettings]
+AWS_BACKUP_BUCKET = file-indexing-service
+AWS_ACCESS_KEY_ID = changeme
+AWS_SECRET_ACCESS_KEY =
+AWS_REGION_NAME = us-east-1
 
 [ElasticSearch]
 ELASTIC_SEARCH_URL = https://search-hubmap-dev-test-hfnqv4ylo5ywvc42vwnyptbup4.us-east-1.es.amazonaws.com
@@ -11,7 +18,7 @@ ELASTIC_SEARCH_PRIVATE_INDEX = hm_dev_consortium_files
 
 [Globus]
 GLOBUS_GROUPS_TOKEN = changeme
-GLOBUS_ROOT_ENDPOINT_FILEPATH = /root/directory/to/globus/data
+GLOBUS_ROOT_ENDPOINT_FILEPATH = /hive/hubmap-localhost/data
 GLOBUS_PUBLIC_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/public
 GLOBUS_CONSORTIUM_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/consortium
 GLOBUS_PROTECTED_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/protected
@@ -22,10 +29,13 @@ NEO4J_USERNAME = neo4j
 NEO4J_PASSWORD = changeme
 
 [Service]
-INGEST_API_URL = http://uuid-api:8080
-UBKG_URL = http://ontology-api:8080
+INGEST_API_URL = https://ingest-api.dev.hubmapconsortium.org
+UBKG_URL = https://ontology-api.dev.hubmapconsortium.org
 UBKG_APPLICATION_CONTEXT = hubmap
-UUID_API_URL = http://uuid-api:8080
+UUID_API_URL = https://uuid-api.dev.hubmapconsortium.org
 
 [Slack]
-SLACK_WEBHOOK_URL = https://hooks.slack.com/changeme
+; Set this variable to DISABLED when no Slack notifications should be
+; posted to the SLACK_NOTIFICATION_CHANNEL e.g. during development.
+; Other Slack settings are in the utility configuration file.
+SLACK_NOTIFICATIONS=

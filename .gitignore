@@ -19,6 +19,7 @@ BUILD
 
 # Configuration
 config.ini
+fileIndexingService.ini
 
 # log files in any path
 **/*.log
