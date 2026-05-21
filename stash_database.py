@@ -143,12 +143,12 @@ def main():
                 aws_secret_access_key=config.aws_secret_access_key,
                 aws_region_name=config.aws_region_name,
             )
-            # Upload a copy of the SQLite database to the versioned AWS S3 Bucket
+            # Upload a copy of the SQLite database to the versioned AWS S3 Bucket for DEEP_ARCHIVE storage.
             uploader.upload_file(
                 key=str(os.path.basename(config.database)),
                 filepath=config.database,
                 last_modified_at=int(start),
-                storage_class="STANDARD",
+                storage_class="DEEP_ARCHIVE",
             )
             elapsed = round(time.time() - start, 2)
             logger.info(f"Finished stashing {os.path.basename(config.database)}"
