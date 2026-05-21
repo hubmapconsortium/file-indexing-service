@@ -1,4 +1,6 @@
-# File Indexing scripts and programs
+# File Indexing Scripts
+
+# Scripts and programs
 
 ## file_indexing.sh
 The `file_indexing.sh` Bash script executes in order the Python programs which make up the
@@ -31,7 +33,7 @@ Scripts arguments
 ### stash_database.py
 
 `stash_database.py` script puts a copy of the SQLite database populated by
-`local_file_index.py` in the AWS versioned S3 Bucket with a Storage Type of `DEEP_ARCHIVE`.
+`local_file_index.py` in the AWS versioned S3 Bucket with a Storage Type of `STANDARD`.
 
 ### es_file_index.py
 
@@ -77,6 +79,12 @@ other projects. Create and populate it once per deployment:
 cd /path/to/file-indexing-service
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+```
+
+Make `file_indexing.sh` executable by its owner before scheduling with cron:
+
+```bash
+chmod u+x file_indexing.sh
 ```
 
 Use whichever `python3` version is available and appropriate for the deployment (Python 3.9 or
@@ -137,5 +145,11 @@ For example, to run daily at 2:00am:
 
 Notes:
 - Use full absolute paths in crontab entries — cron does not inherit your shell's `PATH` or working directory.
-- The `exec_info/` directory must exist before the first run, or the log redirection will fail silently. Create it with `mkdir -p exec_info`.
+- **`exec_info/` must exist before the crontab entry is scheduled.** The `>>` redirect in the
+  crontab line is evaluated by the shell before `file_indexing.sh` starts executing, so the
+  script cannot create it in time. If the directory is missing, the job fails silently with no
+  output anywhere. Create it once on the deployment host before adding the crontab entry:
+  ```bash
+  mkdir -p /full/path/to/file-indexing-service/exec_info
+  ```
 - To test the cron entry without waiting for the scheduled time, run the command directly from your shell first and confirm it exits cleanly.

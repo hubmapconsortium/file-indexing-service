@@ -1,6 +1,7 @@
 [Local]
-DATABASE_FILEPATH = /home/karl/PycharmProjects/file-indexing-service/indexed_files_dev.db
+[Local]
 LOG_ID = dev
+DATABASE_FILEPATH = indexed_files_%(log_id)s.db
 LOG_LEVEL = ERROR  # Options: DEBUG, INFO, WARNING, ERROR
 INDEX_PATHS =   /hive/hubmap-localhost/data/public
                 , /hive/hubmap-localhost/data/consortium
@@ -13,8 +14,8 @@ AWS_REGION_NAME = us-east-1
 
 [ElasticSearch]
 ELASTIC_SEARCH_URL = https://search-hubmap-dev-test-hfnqv4ylo5ywvc42vwnyptbup4.us-east-1.es.amazonaws.com
-ELASTIC_SEARCH_PUBLIC_INDEX = hm_dev_public_files
-ELASTIC_SEARCH_PRIVATE_INDEX = hm_dev_consortium_files
+ELASTIC_SEARCH_PUBLIC_INDEX = hm_%(log_id)s_public_files
+ELASTIC_SEARCH_PRIVATE_INDEX = hm_%(log_id)s_consortium_files
 
 [Globus]
 GLOBUS_GROUPS_TOKEN = changeme
@@ -24,15 +25,15 @@ GLOBUS_CONSORTIUM_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/consorti
 GLOBUS_PROTECTED_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/protected
 
 [Neo4J]
-NEO4J_URI = bolt://neo4j.dev.hubmapconsortium.org:7687
+NEO4J_URI = bolt://neo4j.%(log_id)s.hubmapconsortium.org:7687
 NEO4J_USERNAME = neo4j
 NEO4J_PASSWORD = changeme
 
 [Service]
-INGEST_API_URL = https://ingest-api.dev.hubmapconsortium.org
-UBKG_URL = https://ontology-api.dev.hubmapconsortium.org
+INGEST_API_URL = https://ingest-api.%(log_id)s.hubmapconsortium.org
+UBKG_URL = https://ontology-api.%(log_id)s.hubmapconsortium.org
 UBKG_APPLICATION_CONTEXT = hubmap
-UUID_API_URL = https://uuid-api.dev.hubmapconsortium.org
+UUID_API_URL = https://uuid-api.%(log_id)s.hubmapconsortium.org
 
 [Slack]
 ; Set this variable to DISABLED when no Slack notifications should be
