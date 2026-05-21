@@ -66,7 +66,6 @@ DATASETS_TO_INDEX_QUERY: LiteralString = """
     WHERE a.creation_action IN ['Create Dataset Activity', 'Central Process','Lab Process','External Process']
     AND ds.status IN $statuses
     AND NOT (ds)<-[:REVISION_OF]-(:Entity)
-    AND ds.uuid STARTS WITH '01'
     RETURN ds.uuid AS uuid, ds.hubmap_id AS hubmap_id, ds.group_name AS group_name,
     ds.status AS status, ds.dataset_type AS dataset_type, ds.data_access_level AS data_access_level,
     ds.contains_human_genetic_sequences AS contains_human_genetic_sequences,
@@ -80,7 +79,7 @@ DATASETS_TO_INDEX_QUERY: LiteralString = """
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'entity_type', donor.entity_type])) AS donors,
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'code', organ.organ])) AS organs
     ORDER BY rand()
-"""  # KBKBKB @TODO remove 'AND ds.uuid STARTS WITH '01'' before production
+"""
 
 log_file_name = "Log filename not set"
 logger = logging.getLogger("es-file-index")
