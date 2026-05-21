@@ -3,8 +3,8 @@
 LOG_ID = dev
 DATABASE_FILEPATH = indexed_files_%(log_id)s.db
 LOG_LEVEL = ERROR  # Options: DEBUG, INFO, WARNING, ERROR
-INDEX_PATHS =   /hive/hubmap-localhost/data/public
-                , /hive/hubmap-localhost/data/consortium
+INDEX_PATHS =   /hive/hubmap-%(log_id)s/data/public
+                , /hive/hubmap-%(log_id)s/data/consortium
 
 [AWSSettings]
 AWS_BACKUP_BUCKET = file-indexing-service
@@ -19,7 +19,7 @@ ELASTIC_SEARCH_PRIVATE_INDEX = hm_%(log_id)s_consortium_files
 
 [Globus]
 GLOBUS_GROUPS_TOKEN = changeme
-GLOBUS_ROOT_ENDPOINT_FILEPATH = /hive/hubmap-localhost/data
+GLOBUS_ROOT_ENDPOINT_FILEPATH = /hive/hubmap-%(log_id)s/data
 GLOBUS_PUBLIC_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/public
 GLOBUS_CONSORTIUM_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/consortium
 GLOBUS_PROTECTED_ENDPOINT_FILEPATH = %(GLOBUS_ROOT_ENDPOINT_FILEPATH)s/protected
