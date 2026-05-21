@@ -1,5 +1,7 @@
-[Local]
+[Default]
 LOG_ID = dev
+
+[Local]
 DATABASE_FILEPATH = indexed_files_%(log_id)s.db
 LOG_LEVEL = ERROR  # Options: DEBUG, INFO, WARNING, ERROR
 INDEX_PATHS =   /hive/hubmap-%(log_id)s/data/public
