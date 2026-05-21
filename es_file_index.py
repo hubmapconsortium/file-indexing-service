@@ -1,3 +1,4 @@
+import sys
 import ast
 import hashlib
 import json
@@ -5,13 +6,19 @@ import logging
 import os
 import re
 import signal
-import sys
+
 import threading
 import time
 from argparse import ArgumentParser
 from collections import namedtuple
 from configparser import ConfigParser
-from typing import Optional, Union, LiteralString
+from typing import Optional, Union #, LiteralString
+# While we're still using a Python 3.9 interpreter prior to upgrading our
+# platform, alias LiteralString as needed to satisfy static type checking.
+if sys.version_info >= (3, 11):
+    from typing import LiteralString
+else:
+    LiteralString = str
 from pathlib import Path
 
 from neo4j import Driver, GraphDatabase, Record
@@ -592,7 +599,7 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
     dataset_uuids = []
     with driver.session() as neo4j_session:
         # query for primary and processed datasets with a status of QA or Submitted.
-        datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted'])
+        datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted', 'Approval', 'Published'])
         for dataset in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
