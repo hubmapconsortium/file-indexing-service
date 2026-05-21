@@ -1,5 +1,4 @@
 [Local]
-[Local]
 LOG_ID = dev
 DATABASE_FILEPATH = indexed_files_%(log_id)s.db
 LOG_LEVEL = ERROR  # Options: DEBUG, INFO, WARNING, ERROR
