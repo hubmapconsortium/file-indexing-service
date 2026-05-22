@@ -48,7 +48,7 @@ def parse_config() -> Config:
     return Config(
         database=c.get("Local", "DATABASE_FILEPATH"),
         temp_path=c.get("Local", "TEMP_PATH", fallback="./tmp"),
-        log_id=c.get("Local", "LOG_ID", fallback="default"),
+        log_id=c.get("DEFAULT", "LOG_ID", fallback="default"),
         log_level=c.get("Local", "LOG_LEVEL", fallback="info"),
         slack_notifications=c.get("Slack", "SLACK_NOTIFICATIONS", fallback="ENABLED"),
         aws_backup_bucket=c.get("AWSSettings", "AWS_BACKUP_BUCKET"),

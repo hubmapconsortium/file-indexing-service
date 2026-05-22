@@ -97,7 +97,7 @@ def parse_config() -> Config:
 
     return Config(
         database=c.get("Local", "DATABASE_FILEPATH", fallback="local_file_index.db"),
-        log_id=c.get("Local", "LOG_ID", fallback="default"),
+        log_id=c.get("DEFAULT", "LOG_ID", fallback="default"),
         log_level=c.get("Local", "LOG_LEVEL", fallback="info"),
         elastic_search_url=c.get("ElasticSearch", "ELASTIC_SEARCH_URL"),
         elastic_search_public_index=c.get("ElasticSearch", "ELASTIC_SEARCH_PUBLIC_INDEX"),
@@ -191,12 +191,19 @@ def get_files_from_uuid_api(dataset_uuid: str) -> list[dict]:
         headers={"Authorization": f"Bearer {config.globus_groups_token}"},
         timeout=TIMEOUT,
     )
-    if res.status_code != 200:
-        msg = f"Error fetching files: {res.status_code}"
-        raise Exception(msg)
-
-    return res.json()
-
+    if res.status_code >= 200 and res.status_code < 300:
+        return res.json()
+    elif res.status_code in [303]:
+        s3_response = session.get(res.content.decode(), timeout=TIMEOUT)
+        if s3_response.status_code >= 200 and s3_response.status_code < 300:
+            return s3_response.json()
+        else:
+            err_msg =   f"Error fetching the large response content from AWS S3 at:" \
+                        f" {res.content.decode()}"
+    else:
+        err_msg = f"HTTP {res.status_code} error fetching files using:" \
+                  f" {config.uuid_api_url}/{dataset_uuid}/files"
+    raise Exception(err_msg)
 
 def get_dataset_globus_path(dataset: Record) -> str:
     if dataset["contains_human_genetic_sequences"] is True:

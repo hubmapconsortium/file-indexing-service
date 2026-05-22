@@ -65,22 +65,23 @@ class FileManager:
                     f"Error fetching analyte_class for dataset {dataset['uuid']}: {e}"
                 )
 
-            # get the dataset type hierarchy
-            try:
-                if dataset["dataset_type"] in self._dataset_type_hierarchy_map:
-                    info["dataset_type_hierarchy"] = {
-                        "first_level": self._dataset_type_hierarchy_map[dataset["dataset_type"]],
-                        "second_level": dataset["dataset_type"],
-                    }
-                else:
-                    info["dataset_type_hierarchy"] = {
-                        "first_level": dataset["dataset_type"],
-                        "second_level": dataset["dataset_type"],
-                    }
-            except Exception as e:
-                self._logger.error(
-                    f"Error fetching dataset_type_hierarchy for dataset {dataset['uuid']}: {e}"
-                )
+            # get the dataset type hierarchy if supported i.e. for SN but not HM
+            if self._dataset_type_hierarchy_map:
+                try:
+                    if dataset["dataset_type"] in self._dataset_type_hierarchy_map:
+                        info["dataset_type_hierarchy"] = {
+                            "first_level": self._dataset_type_hierarchy_map[dataset["dataset_type"]],
+                            "second_level": dataset["dataset_type"],
+                        }
+                    else:
+                        info["dataset_type_hierarchy"] = {
+                            "first_level": dataset["dataset_type"],
+                            "second_level": dataset["dataset_type"],
+                        }
+                except Exception as e:
+                    self._logger.error(
+                        f"Error fetching dataset_type_hierarchy for dataset {dataset['uuid']}: {e}"
+                    )
 
             return info
 

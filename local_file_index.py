@@ -52,7 +52,7 @@ def parse_config() -> Config:
 
     # Validate arguments
     paths = tuple(
-        p.strip() for p in c.get("Local", "INDEX_PATHS", fallback="").split(",") if p.strip()
+        p.strip() for p in c.get("Globus", "INDEX_PATHS", fallback="").split(",") if p.strip()
     )
     invalid_paths = [p for p in paths if not os.path.isdir(p)]
     if len(invalid_paths) > 0:
@@ -61,7 +61,7 @@ def parse_config() -> Config:
     return Config(
         paths=paths,
         database=c.get("Local", "DATABASE_FILEPATH", fallback="local_file_index.db"),
-        log_id=c.get("Local", "LOG_ID", fallback="default"),
+        log_id=c.get("DEFAULT", "LOG_ID", fallback="default"),
         log_level=c.get("Local", "LOG_LEVEL", fallback="info"),
         slack_notifications=c.get("Slack", "SLACK_NOTIFICATIONS", fallback="ENABLED"),
         create_new_database=args.create_new_database,
