@@ -401,8 +401,23 @@ def index_published_datasets(
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
 
+            try:
+                # Neo4j's result iteration is lazy — it fetches the next record from the server when accesed.
+                # APOC parsing errors can happen server-side during that fetch which Python sees when it
+                # tries to read any field from the record.
+                # Wrapping just dataset["uuid"] catches it at the earliest possible moment while keeping the
+                # rest of the existing try/except blocks intact for their specific error cases.
+                dataset_uuid = dataset["uuid"]
+            except Exception as e:
+                # APOC JSON parsing errors (e.g. unescaped control characters in ds.metadata)
+                # surface here during Neo4j result iteration, before uuid is accessible.
+                err_msg = f"Skipping dataset with unparseable Neo4j record: {e}"
+                logger.error(err_msg)
+                num_errors += 1
+                continue
+
             time.sleep(1)
-            dataset_uuids.append(dataset["uuid"])
+            dataset_uuids.append(dataset_uuid)
 
             # add organ label and hierarchy from ubkg to each organ
             organs = [
