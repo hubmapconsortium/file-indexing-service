@@ -73,8 +73,8 @@ DATASETS_TO_INDEX_QUERY: LiteralString = """
     RETURN ds.uuid AS uuid, ds.hubmap_id AS hubmap_id, ds.group_name AS group_name,
     ds.status AS status, ds.dataset_type AS dataset_type, ds.data_access_level AS data_access_level,
     ds.contains_human_genetic_sequences AS contains_human_genetic_sequences,
-    replace(replace(ds.metadata, 'True', 'true'), 'False', 'false') AS metadata_str,
-    replace(replace(ds.files, 'True', 'true'), 'False', 'false') AS files_str,
+    ds.metadata AS metadata_str,
+    ds.files AS files_str,
     a.creation_action AS creation_action,
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'entity_type', donor.entity_type])) AS donors,
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'code', organ.organ])) AS organs
@@ -391,8 +391,8 @@ def parse_dataset_record(record) -> Optional[dict]:
         dataset = dict(record)
         raw_metadata = dataset.pop("metadata_str", None)
         raw_files = dataset.pop("files_str", None)
-        dataset["metadata"] = json.loads(raw_metadata) if raw_metadata else {}
-        dataset["files"] = json.loads(raw_files) if raw_files else []
+        dataset["metadata"] = ast.literal_eval(raw_metadata) if raw_metadata else {}
+        dataset["files"] = ast.literal_eval(raw_files) if raw_files else []
         return dataset
     except Exception as e:
         uuid = dict(record).get("uuid", "unknown")
