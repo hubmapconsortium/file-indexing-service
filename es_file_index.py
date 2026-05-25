@@ -430,7 +430,7 @@ def index_published_datasets(
 
             time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
-            logger.info(f"Processing Dataset {dataset["uuid"]}")
+            logger.info(f"Processing Dataset {dataset['uuid']}")
 
             # add organ label and hierarchy from ubkg to each organ
             organs = [
@@ -653,7 +653,7 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
 
             time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
-            logger.info(f"Processing Dataset {dataset["uuid"]}")
+            logger.info(f"Processing Dataset {dataset['uuid']}")
 
             # add organ label and hierarchy from ubkg to each organ
             organs = [
