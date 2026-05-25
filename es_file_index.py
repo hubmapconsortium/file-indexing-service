@@ -415,7 +415,6 @@ def index_published_datasets(
         # Avoid using APOC in Neo4j Cypher query so that bad data which causes Exceptions to be
         # thrown are handled in this script rather than from server.
         datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['Published'])
-        logger.info(f"Retrieved {str(len(datasets))} Dataset which are Published")
         for raw_record in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
@@ -638,7 +637,6 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
         # thrown are handled in this script rather than from server.
         # KBKBKB @TODO - confirm 'Approval' goes here and not with 'Published'
         datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted', 'Approval'])
-        logger.info(f"Retrieved {str(len(datasets))} Dataset which are 'QA', 'Submitted' or 'Approval'")
         for raw_record in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
