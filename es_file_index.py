@@ -396,28 +396,31 @@ def index_published_datasets(
         # query for primary and processed datasets with a status of Published
         datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['Published'])
 
-        for dataset in datasets:
-            if terminate_event.is_set():
-                logger.info("Termination signal received, stopping indexing.")
-                return dataset_uuids, num_errors
+        # Neo4j result iteration is lazy — each call to next() fetches the next record from
+        # the server. APOC JSON parsing errors (e.g. unescaped control characters in ds.metadata)
+        # surface during that fetch and cannot be caught inside a standard for loop body i.e.
+        # for dataset in datasets.
+        # Using explicit next() calls lets us catch and skip individual bad records while
+        # continuing to process the rest of the result set.
 
+        datasets_iter = iter(datasets)
+        while True:
             try:
-                # Neo4j's result iteration is lazy — it fetches the next record from the server when accesed.
-                # APOC parsing errors can happen server-side during that fetch which Python sees when it
-                # tries to read any field from the record.
-                # Wrapping just dataset["uuid"] catches it at the earliest possible moment while keeping the
-                # rest of the existing try/except blocks intact for their specific error cases.
-                dataset_uuid = dataset["uuid"]
+                dataset = next(datasets_iter)
+            except StopIteration:
+                break
             except Exception as e:
-                # APOC JSON parsing errors (e.g. unescaped control characters in ds.metadata)
-                # surface here during Neo4j result iteration, before uuid is accessible.
                 err_msg = f"Skipping dataset with unparseable Neo4j record: {e}"
                 logger.error(err_msg)
                 num_errors += 1
                 continue
 
+            if terminate_event.is_set():
+                logger.info("Termination signal received, stopping indexing.")
+                return dataset_uuids, num_errors
+
             time.sleep(1)
-            dataset_uuids.append(dataset_uuid)
+            dataset_uuids.append(dataset["uuid"])
 
             # add organ label and hierarchy from ubkg to each organ
             organs = [
@@ -621,7 +624,24 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
     with driver.session() as neo4j_session:
         # query for primary and processed datasets with a status of QA or Submitted.
         datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted', 'Approval', 'Published'])
-        for dataset in datasets:
+        # Same lazy-iteration pattern as index_published_datasets — see comment there.
+        datasets_iter = iter(datasets)
+        while True:
+            try:
+                dataset = next(datasets_iter)
+            except StopIteration:
+                break
+            except Exception as e:
+                err_msg = f"Skipping dataset with unparseable Neo4j record: {e}"
+                logger.error(err_msg)
+                service_utils.postToSlackChannel(
+                    channel=util_config['SLACK_NOTIFICATION_CHANNEL'],
+                    msg=f"{util_config['SLACK_BAD_NEWS_EMOJI']} {err_msg}",
+                    mentions_dict=slack_user_id_mentions_on_error_dict,
+                )
+                num_errors += 1
+                continue
+
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
