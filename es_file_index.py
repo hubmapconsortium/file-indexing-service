@@ -61,6 +61,10 @@ UUIDFileInfo = namedtuple(
 
 # Cypher query for HuBMAP to get primary and processed Datasets with certain creation_action Activity, and
 # supporting substitutable Dataset status value lists for different functions.
+# Note: ds.metadata and ds.files are returned as raw strings rather than parsed via APOC.
+# This avoids Neo.ClientError.Procedure.ProcedureCallFailed errors caused by invalid JSON
+# (e.g. unescaped control characters) in individual dataset records which would otherwise
+# kill the entire Neo4j session. Parsing is done per-record in Python instead.
 DATASETS_TO_INDEX_QUERY: LiteralString = """
     MATCH (donor:Donor)-[:ACTIVITY_INPUT]->(organ_activity:Activity)-[:ACTIVITY_OUTPUT]->(organ:Sample {sample_category:'organ'})-[*]->(a:Activity)-[:ACTIVITY_OUTPUT]->(ds:Dataset)
     WHERE a.creation_action IN ['Create Dataset Activity', 'Central Process','Lab Process','External Process']
@@ -69,12 +73,8 @@ DATASETS_TO_INDEX_QUERY: LiteralString = """
     RETURN ds.uuid AS uuid, ds.hubmap_id AS hubmap_id, ds.group_name AS group_name,
     ds.status AS status, ds.dataset_type AS dataset_type, ds.data_access_level AS data_access_level,
     ds.contains_human_genetic_sequences AS contains_human_genetic_sequences,
-    apoc.convert.fromJsonMap(
-        replace(replace(ds.metadata, 'True', 'true'), 'False', 'false')
-    ) AS metadata,
-    apoc.convert.fromJsonList(
-        replace(replace(ds.files, 'True', 'true'), 'False', 'false')
-    ) AS files,
+    replace(replace(ds.metadata, 'True', 'true'), 'False', 'false') AS metadata_str,
+    replace(replace(ds.files, 'True', 'true'), 'False', 'false') AS files_str,
     a.creation_action AS creation_action,
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'entity_type', donor.entity_type])) AS donors,
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'code', organ.organ])) AS organs
@@ -383,6 +383,23 @@ def get_organ_hierarchy(organ: dict) -> str:
     return organ["term"]
 
 
+def parse_dataset_record(record) -> Optional[dict]:
+    """Parse a raw Neo4j dataset record, converting metadata_str and files_str from
+    JSON strings to Python objects. Returns None if the record cannot be parsed,
+    allowing the caller to skip it without aborting the entire result set."""
+    try:
+        dataset = dict(record)
+        raw_metadata = dataset.pop("metadata_str", None)
+        raw_files = dataset.pop("files_str", None)
+        dataset["metadata"] = json.loads(raw_metadata) if raw_metadata else {}
+        dataset["files"] = json.loads(raw_files) if raw_files else []
+        return dataset
+    except Exception as e:
+        uuid = dict(record).get("uuid", "unknown")
+        logger.error(f"Skipping dataset {uuid} — failed to parse record: {e}")
+        return None
+
+
 def index_published_datasets(
         ubkg_organs: dict,
         driver: Driver,
@@ -394,30 +411,25 @@ def index_published_datasets(
     dataset_uuids = []
     with driver.session() as neo4j_session:
         # query for primary and processed datasets with a status of Published
+        #
+        # Avoid using APOC in Neo4j Cypher query so that bad data which causes Exceptions to be
+        # thrown are handled in this script rather than from server.
         datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['Published'])
-
-        # Neo4j result iteration is lazy — each call to next() fetches the next record from
-        # the server. APOC JSON parsing errors (e.g. unescaped control characters in ds.metadata)
-        # surface during that fetch and cannot be caught inside a standard for loop body i.e.
-        # for dataset in datasets.
-        # Using explicit next() calls lets us catch and skip individual bad records while
-        # continuing to process the rest of the result set.
-
-        datasets_iter = iter(datasets)
-        while True:
-            try:
-                dataset = next(datasets_iter)
-            except StopIteration:
-                break
-            except Exception as e:
-                err_msg = f"Skipping dataset with unparseable Neo4j record: {e}"
-                logger.error(err_msg)
-                num_errors += 1
-                continue
-
+        for raw_record in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
+
+            dataset = parse_dataset_record(raw_record)
+            if dataset is None:
+                err_msg = f"Skipping dataset — failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
+                service_utils.postToSlackChannel(
+                    channel=util_config['SLACK_NOTIFICATION_CHANNEL'],
+                    msg=f"{util_config['SLACK_BAD_NEWS_EMOJI']} {err_msg}",
+                    mentions_dict=slack_user_id_mentions_on_error_dict,
+                )
+                num_errors += 1
+                continue
 
             time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
@@ -623,17 +635,18 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
     dataset_uuids = []
     with driver.session() as neo4j_session:
         # query for primary and processed datasets with a status of QA or Submitted.
+        #
+        # Avoid using APOC in Neo4j Cypher query so that bad data which causes Exceptions to be
+        # thrown are handled in this script rather than from server.
         datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted', 'Approval', 'Published'])
-        # Same lazy-iteration pattern as index_published_datasets — see comment there.
-        datasets_iter = iter(datasets)
-        while True:
-            try:
-                dataset = next(datasets_iter)
-            except StopIteration:
-                break
-            except Exception as e:
-                err_msg = f"Skipping dataset with unparseable Neo4j record: {e}"
-                logger.error(err_msg)
+        for raw_record in datasets:
+            if terminate_event.is_set():
+                logger.info("Termination signal received, stopping indexing.")
+                return dataset_uuids, num_errors
+
+            dataset = parse_dataset_record(raw_record)
+            if dataset is None:
+                err_msg = f"Skipping dataset — failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
                 service_utils.postToSlackChannel(
                     channel=util_config['SLACK_NOTIFICATION_CHANNEL'],
                     msg=f"{util_config['SLACK_BAD_NEWS_EMOJI']} {err_msg}",
@@ -641,10 +654,6 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                 )
                 num_errors += 1
                 continue
-
-            if terminate_event.is_set():
-                logger.info("Termination signal received, stopping indexing.")
-                return dataset_uuids, num_errors
 
             time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
