@@ -423,11 +423,7 @@ def index_published_datasets(
             dataset = parse_dataset_record(raw_record)
             if dataset is None:
                 err_msg = f"Skipping dataset — failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
-                service_utils.postToSlackChannel(
-                    channel=util_config['SLACK_NOTIFICATION_CHANNEL'],
-                    msg=f"{util_config['SLACK_BAD_NEWS_EMOJI']} {err_msg}",
-                    mentions_dict=slack_user_id_mentions_on_error_dict,
-                )
+                logger.error(err_msg)
                 num_errors += 1
                 continue
 
