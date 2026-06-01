@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from configparser import ConfigParser
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional, Tuple
 
 import requests
 
@@ -125,7 +126,7 @@ def setup_lock_file(db_path: str):
             os.remove(lock_file)
 
 
-def extract_dataset_uuid(fpath: str) -> str | None:
+def extract_dataset_uuid(fpath: str) -> Optional[str]:
     """Extract the first 32-character lowercase hex component from a file path.
     Returns None and logs a warning if no such component is found."""
     for part in Path(fpath).parts:
@@ -168,7 +169,7 @@ def get_uuid_api_checksums(dataset_uuid: str) -> dict:
         return {}
 
 
-def get_checksums_for_file(dataset_uuid: str, fpath: str) -> tuple[str | None, str | None]:
+def get_checksums_for_file(dataset_uuid: str, fpath: str) -> Tuple[Optional[str], Optional[str]]:
     """Return (md5_checksum, sha256_checksum) for a file, using the UUID API cache.
     Fetches from UUID API on first encounter of dataset_uuid, then caches for subsequent files."""
     with _uuid_api_cache_lock:

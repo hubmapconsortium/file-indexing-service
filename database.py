@@ -2,6 +2,7 @@ import logging
 import os
 import sqlite3
 from collections import namedtuple
+from typing import List, Optional
 
 FileInfo = namedtuple("FileInfo", ["path", "size", "last_modified_at", "dataset_uuid", "uuid_api_md5", "uuid_api_sha256"])
 DBFile = namedtuple("DBFile", ["path", "rel_path", "size", "last_modified_at"])
@@ -69,7 +70,7 @@ class Database:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def insert_files(self, files: list[FileInfo]):
+    def insert_files(self, files: List[FileInfo]):
         try:
             with self.conn:
                 # transaction
@@ -106,7 +107,7 @@ class Database:
         except Exception as e:
             logger.error(f"Database insert error: {e}")
 
-    def query_files(self, path_prefix: str) -> list[DBFile]:
+    def query_files(self, path_prefix: str) -> List[DBFile]:
         query = """
             SELECT path, size, last_modified_at
             FROM files
@@ -130,7 +131,7 @@ class Database:
         result = cur.fetchone()
         return result[0] if result else 0
 
-    def update_files(self, files: list[VersionedFileInfo]):
+    def update_files(self, files: List[VersionedFileInfo]):
         """Update the aws_version for a list of files after backup.
         Used by file_backup.py."""
         try:
