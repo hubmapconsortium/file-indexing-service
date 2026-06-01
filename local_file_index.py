@@ -1,4 +1,5 @@
 import logging
+import re
 import sys
 import os
 import queue
@@ -13,12 +14,15 @@ from configparser import ConfigParser
 from contextlib import contextmanager
 from pathlib import Path
 
+import requests
+
 # Import service resources
 from database import Database, FileInfo
 from file_indexing_utils import FileIndexingUtils
 
 BATCH_SIZE = 10000
 MAX_WORKERS = 8
+UUID_API_TIMEOUT = 30  # seconds
 
 Config = namedtuple(
     "Config",
@@ -29,12 +33,24 @@ Config = namedtuple(
         "slack_notifications",
         "paths",
         "create_new_database",
+        "uuid_api_url",
+        "globus_token",
     ],
 )
 
 log_file_name = "Log filename not set"
 logger = logging.getLogger("local_file_index")
 terminate_event = threading.Event()
+
+# Thread-safe cache of UUID API responses keyed by dataset_uuid.
+# Each entry is a dict mapping rel_path -> {md5_checksum, sha256_checksum}.
+# Populated on first encounter of a dataset_uuid; shared across file_walk_worker threads.
+_uuid_api_cache: dict = {}
+_uuid_api_cache_lock = threading.Lock()
+
+# Regex for a 32-character lowercase hex UUID
+_UUID_RE = re.compile(r'[0-9a-f]{32}')
+
 
 def parse_config() -> Config:
     parser = ArgumentParser(description="Backup file info to local SQLite database.")
@@ -65,6 +81,8 @@ def parse_config() -> Config:
         log_level=c.get("Local", "LOG_LEVEL", fallback="info"),
         slack_notifications=c.get("Slack", "SLACK_NOTIFICATIONS", fallback="ENABLED"),
         create_new_database=args.create_new_database,
+        uuid_api_url=c.get("Service", "UUID_API_URL", fallback=None),
+        globus_token=c.get("Globus", "GLOBUS_GROUPS_TOKEN", fallback=None),
     )
 
 
@@ -107,27 +125,136 @@ def setup_lock_file(db_path: str):
             os.remove(lock_file)
 
 
+def extract_dataset_uuid(fpath: str) -> str | None:
+    """Extract the first 32-character lowercase hex component from a file path.
+    Returns None and logs a warning if no such component is found."""
+    for part in Path(fpath).parts:
+        if _UUID_RE.fullmatch(part):
+            return part
+    logger.warning(f"Could not extract dataset UUID from path: {fpath}")
+    return None
+
+
+def get_uuid_api_checksums(dataset_uuid: str) -> dict:
+    """Fetch checksums for all files in a dataset from the UUID API.
+    Returns a dict mapping rel_path -> {md5_checksum, sha256_checksum}.
+    Returns an empty dict on any error so callers can proceed without checksums."""
+    if not config.uuid_api_url or not config.globus_token:
+        return {}
+
+    url = f"{config.uuid_api_url}/{dataset_uuid}/files"
+    try:
+        res = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {config.globus_token}"},
+            timeout=UUID_API_TIMEOUT,
+        )
+        if res.status_code != 200:
+            logger.warning(
+                f"UUID API returned {res.status_code} for dataset {dataset_uuid}: {url}"
+            )
+            return {}
+        files = res.json()
+        return {
+            f["path"]: {
+                "md5_checksum": f.get("md5_checksum"),
+                "sha256_checksum": f.get("sha256_checksum"),
+            }
+            for f in files
+            if "path" in f
+        }
+    except Exception as e:
+        logger.warning(f"UUID API call failed for dataset {dataset_uuid}: {e}")
+        return {}
+
+
+def get_checksums_for_file(dataset_uuid: str, fpath: str) -> tuple[str | None, str | None]:
+    """Return (md5_checksum, sha256_checksum) for a file, using the UUID API cache.
+    Fetches from UUID API on first encounter of dataset_uuid, then caches for subsequent files."""
+    with _uuid_api_cache_lock:
+        if dataset_uuid in _uuid_api_cache:
+            checksum_map = _uuid_api_cache[dataset_uuid]
+            for rel_path, checksums in checksum_map.items():
+                if fpath.endswith(rel_path):
+                    return checksums["md5_checksum"], checksums["sha256_checksum"]
+            return None, None
+
+    # Fetch outside the lock so other threads are not blocked during the API call
+    checksum_map = get_uuid_api_checksums(dataset_uuid)
+    with _uuid_api_cache_lock:
+        # Another thread may have fetched while we were calling the API — keep first result
+        if dataset_uuid not in _uuid_api_cache:
+            _uuid_api_cache[dataset_uuid] = checksum_map
+            logger.info(
+                f"UUID API: cached {len(checksum_map)} file checksums for dataset {dataset_uuid}"
+            )
+
+    for rel_path, checksums in checksum_map.items():
+        if fpath.endswith(rel_path):
+            return checksums["md5_checksum"], checksums["sha256_checksum"]
+    return None, None
+
+
+def _process_file(fpath: str, file_queue: queue.Queue) -> int:
+    """Stat a single file, look up checksums from UUID API cache, and put it on the queue.
+    Returns 1 on error, 0 on success."""
+    try:
+        stat = os.lstat(fpath)
+        if os.path.islink(fpath):
+            return 0
+
+        dataset_uuid = extract_dataset_uuid(fpath)
+        md5, sha256 = (None, None)
+        if dataset_uuid:
+            md5, sha256 = get_checksums_for_file(dataset_uuid, fpath)
+
+        file_queue.put(FileInfo(
+            path=fpath,
+            size=stat.st_size,
+            last_modified_at=int(stat.st_mtime),
+            dataset_uuid=dataset_uuid,
+            uuid_api_md5=md5,
+            uuid_api_sha256=sha256,
+        ))
+        return 0
+    except Exception as e:
+        logger.error(f"Error getting info for {fpath}: {e}")
+        return 1
+
+
 def file_walk_worker(
     dir_path: str,
     file_queue: queue.Queue,
 ) -> int:
     logger.debug(f"Started indexing of {dir_path}")
     error_count = 0
-    for root, _, files in os.walk(dir_path, followlinks=False):
+    for root, dirs, files in os.walk(dir_path, followlinks=False):
+        if terminate_event.is_set():
+            logger.debug(f"Termination signal received, stopping indexing of {dir_path}")
+            return error_count
+
+        # Identify zarr subdirectories before descending into them.
+        # For each zarr directory: walk its entire subtree looking only for *.zarr.zip files,
+        # then prune it so os.walk does not descend into it again.
+        zarr_dirs = [d for d in dirs if 'zarr' in d]
+        for zarr_dir in zarr_dirs:
+            zarr_root = os.path.join(root, zarr_dir)
+            for zroot, _, zfiles in os.walk(zarr_root, followlinks=False):
+                if terminate_event.is_set():
+                    logger.debug(f"Termination signal received, stopping indexing of {dir_path}")
+                    return error_count
+                for zfname in zfiles:
+                    if zfname.endswith('.zarr.zip'):
+                        error_count += _process_file(os.path.join(zroot, zfname), file_queue)
+            dirs.remove(zarr_dir)  # prune — os.walk will not descend here
+
+        # Process non-zarr files in the current directory normally
         for fname in files:
             if terminate_event.is_set():
                 logger.debug(f"Termination signal received, stopping indexing of {dir_path}")
                 return error_count
+            error_count += _process_file(os.path.join(root, fname), file_queue)
 
-            fpath = os.path.join(root, fname)
-            try:
-                stat = os.lstat(fpath)
-                if os.path.islink(fpath):
-                    continue
-                file_queue.put(FileInfo(fpath, stat.st_size, int(stat.st_mtime)))
-            except Exception as e:
-                logger.error(f"Error getting info for {fpath}: {e}")
-                error_count += 1
     logger.debug(f"Finished indexing of {dir_path}")
     return error_count
 
@@ -188,6 +315,7 @@ util_config = service_utils.get_config()
 # Create a usable Python dict globals from the str in the INI file
 slack_user_id_mentions_on_error_dict = ast.literal_eval(util_config['SLACK_USER_ID_MENTIONS_ON_ERROR'])
 slack_user_id_mentions_on_success_dict = ast.literal_eval(util_config['SLACK_USER_ID_MENTIONS_ON_SUCCESS'])
+
 
 def main():
 

@@ -3,7 +3,7 @@ import os
 import sqlite3
 from collections import namedtuple
 
-FileInfo = namedtuple("FileInfo", ["path", "size", "last_modified_at"])
+FileInfo = namedtuple("FileInfo", ["path", "size", "last_modified_at", "dataset_uuid", "uuid_api_md5", "uuid_api_sha256"])
 DBFile = namedtuple("DBFile", ["path", "rel_path", "size", "last_modified_at"])
 VersionedFileInfo = namedtuple("VersionedFileInfo", ["path", "version", "aws_version"])
 
@@ -37,6 +37,11 @@ class Database:
                     aws_version TEXT,
                     size INTEGER NOT NULL,
                     last_modified_at INTEGER NOT NULL,
+                    dataset_uuid TEXT,
+                    uuid_api_md5 TEXT,
+                    uuid_api_sha256 TEXT,
+                    es_upsert_dt TEXT,
+                    es_id TEXT,
                     PRIMARY KEY (path, version)
                 )
                 """
@@ -85,17 +90,17 @@ class Database:
                         if db_size != f.size or db_last_modified_at != f.last_modified_at:
                             # update existing file
                             self.conn.execute(
-                                "INSERT INTO files (path, version, size, last_modified_at) "
-                                "VALUES (?, ?, ?, ?)",
-                                (f.path, db_version + 1, f.size, f.last_modified_at),
+                                "INSERT INTO files (path, version, size, last_modified_at, dataset_uuid, uuid_api_md5, uuid_api_sha256) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (f.path, db_version + 1, f.size, f.last_modified_at, f.dataset_uuid, f.uuid_api_md5, f.uuid_api_sha256),
                             )
                             logger.debug(f"Updated file {f.path} to version {db_version + 1}")
                     else:
                         # insert new file
                         self.conn.execute(
-                            "INSERT INTO files (path, version, size, last_modified_at) "
-                            "VALUES (?, ?, ?, ?)",
-                            (f.path, 1, f.size, f.last_modified_at),
+                            "INSERT INTO files (path, version, size, last_modified_at, dataset_uuid, uuid_api_md5, uuid_api_sha256) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (f.path, 1, f.size, f.last_modified_at, f.dataset_uuid, f.uuid_api_md5, f.uuid_api_sha256),
                         )
                         logger.debug(f"Inserted new file {f.path}")
         except Exception as e:

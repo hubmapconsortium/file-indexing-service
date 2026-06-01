@@ -586,7 +586,7 @@ def index_published_datasets(
                         num_errors += 1
 
                     logger.info(
-                        f"Upserting file {local_file.rel_path} in dataset {dataset['uuid']}"
+                        f"Buffering ES Document for upsert for file {local_file.rel_path} in Dataset {dataset['uuid']}"
                     )
                     doc = {
                         "sha256_checksum": uuid_file["sha256_checksum"],
@@ -757,7 +757,7 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                         num_errors += 1
 
                     logger.info(
-                        f"Upserting file {local_file.rel_path} in dataset {dataset['uuid']}"
+                        f"Buffering ES Document for upsert for file {local_file.rel_path} in Dataset {dataset['uuid']}"
                     )
                     doc = {
                         "dataset_uuid": dataset["uuid"],
