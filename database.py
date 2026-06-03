@@ -6,6 +6,7 @@ from typing import List, Optional
 
 FileInfo = namedtuple("FileInfo", ["path", "size", "last_modified_at", "dataset_uuid", "uuid_api_md5", "uuid_api_sha256"])
 DBFile = namedtuple("DBFile", ["path", "rel_path", "size", "last_modified_at"])
+DBFilePart = namedtuple("DBFilePart", ["path", "rel_path", "size", "last_modified_at", "dataset_uuid"])
 VersionedFileInfo = namedtuple("VersionedFileInfo", ["path", "version", "aws_version"])
 
 logger = logging.getLogger("database")
@@ -120,6 +121,27 @@ class Database:
         """
         return [
             DBFile(row[0], os.path.relpath(row[0], path_prefix), row[1], row[2])
+            for row in self.conn.execute(query, (f"{path_prefix}%",))
+        ]
+
+    def query_files_part(self, path_prefix: str, partition_clause: str) -> List[DBFilePart]:
+        """Query files by path prefix, filtered by a SQL clause from PARTITION_CLAUSES.
+        Used by es_file_index_part_bootstrap.py to limit each instance to its assigned
+        partition of dataset UUIDs. The clause is injected directly into the query —
+        callers must only pass values from the hardcoded PARTITION_CLAUSES dict."""
+        query = f"""
+            SELECT path, size, last_modified_at, dataset_uuid
+            FROM files
+            WHERE (path, last_modified_at) IN (
+                SELECT path, MAX(last_modified_at)
+                FROM files
+                WHERE path LIKE ?
+                AND {partition_clause}
+                GROUP BY path
+            )
+        """
+        return [
+            DBFilePart(row[0], os.path.relpath(row[0], path_prefix), row[1], row[2], row[3])
             for row in self.conn.execute(query, (f"{path_prefix}%",))
         ]
 
