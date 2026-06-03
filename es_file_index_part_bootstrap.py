@@ -342,7 +342,7 @@ def generate_checksums(filepath: str) -> Tuple[str, str]:
     return md5.hexdigest(), sha256.hexdigest()
 
 
-def create_file_info(file: DBFile) -> UUIDFileInfo:
+def create_file_info(file: DBFilePart) -> UUIDFileInfo:
     md5_checksum, sha256_checksum = generate_checksums(file.path)
 
     return UUIDFileInfo(
