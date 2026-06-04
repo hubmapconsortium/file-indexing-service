@@ -657,6 +657,13 @@ def index_published_datasets(
                     logger.error(f"Error flushing remaining inserts for dataset {dataset['uuid']}: {e}")
                     num_errors += 1
 
+            # keep-alive ping to Neo4j after each dataset to prevent connection timeout
+            # between dataset iterations, which can be lengthy for large datasets
+            try:
+                neo4j_session.run("RETURN 1")
+            except Exception as e:
+                logger.warning(f"Neo4j keep-alive ping after dataset {dataset['uuid']} failed: {e}")
+
     return dataset_uuids, num_errors
 
 
@@ -823,6 +830,13 @@ def index_qa_datasets(
                 except Exception as e:
                     logger.error(f"Error flushing remaining inserts for dataset {dataset['uuid']}: {e}")
                     num_errors += 1
+
+            # keep-alive ping to Neo4j after each dataset to prevent connection timeout
+            # between dataset iterations, which can be lengthy for large datasets
+            try:
+                neo4j_session.run("RETURN 1")
+            except Exception as e:
+                logger.warning(f"Neo4j keep-alive ping after dataset {dataset['uuid']} failed: {e}")
 
     return dataset_uuids, num_errors
 

@@ -79,7 +79,7 @@ UUIDFileInfo = namedtuple(
 # When es_inserts reaches this size, flush to ElasticSearch immediately rather than
 # waiting for the end of the dataset loop. Limits memory usage and reduces the risk
 # of losing work if the process is interrupted.
-FLUSH_ES_DOCS_LEVEL = 5000
+FLUSH_ES_DOCS_LEVEL = 50  # KBKBKB @TODO set to 1000 before production
 
 # Set to a list of Dataset UUIDs to limit indexing to specific datasets during development.
 # Set to an empty list or None to index all datasets.
@@ -91,13 +91,12 @@ DEBUG_DATASET_UUID_LIST = []
 PARTITION_KEY = '0-3'   # set this to the key for this instance
 
 # Dataset size filter constants.
-# Datasets whose file count is less than or equal to DS_FILE_COUNT_LE_THRESHOLD or
-# whose file count is greater than or equal to DS_FILE_COUNT_GE_THRESHOLD
-# are skipped by this instance.
+# Datasets whose file count is below DS_FILE_COUNT_MIN_THRESHOLD or above
+# DS_FILE_COUNT_MAX_THRESHOLD are skipped by this instance.
 # Datasets with NULL dataset_uuid get a file count of 0, so they are processed
-# when DS_FILE_COUNT_LE_THRESHOLD = 0 and skipped otherwise.
-DS_FILE_COUNT_LE_THRESHOLD = 50000
-DS_FILE_COUNT_GE_THRESHOLD = 500000
+# when DS_FILE_COUNT_MIN_THRESHOLD = 0 and skipped otherwise.
+DS_FILE_COUNT_MIN_THRESHOLD = 50000
+DS_FILE_COUNT_MAX_THRESHOLD = 500000
 
 # Character spans for each partition key, used for both Python-side filtering
 # and generating the PARTITION_CLAUSES SQL fragments.
@@ -186,7 +185,7 @@ def setup_logger(log_id: str, log_level: str):
         os.makedirs("exec_info")
 
     log_file_name = os.path.join(
-        "exec_info", f"es-file-index-{config.log_id}-{PARTITION_KEY}-{DS_FILE_COUNT_LE_THRESHOLD}-{DS_FILE_COUNT_GE_THRESHOLD}-{time.strftime('%Y-%m-%d-%H-%M-%S')}.log"
+        "exec_info", f"es-file-index-{config.log_id}-{PARTITION_KEY}-{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}-{time.strftime('%Y-%m-%d-%H-%M-%S')}.log"
     )
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
@@ -406,7 +405,7 @@ def parse_dataset_record(record) -> Optional[dict]:
         return None
 
 
-BOOTSTRAP_CHECKPOINT_FILE = f"exec_info/bootstrap_checkpoint_{PARTITION_KEY}_{DS_FILE_COUNT_LE_THRESHOLD}-{DS_FILE_COUNT_GE_THRESHOLD}.txt"
+BOOTSTRAP_CHECKPOINT_FILE = f"exec_info/bootstrap_checkpoint_{PARTITION_KEY}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}.txt"
 
 
 datasets_by_file_count: dict = {}
@@ -426,7 +425,7 @@ def load_datasets_by_file_count(db: Database) -> dict:
     result = {row[0]: row[1] for row in db.conn.execute(query)}
     logger.info(
         f"Loaded file counts for {len(result):,} datasets from SQLite. "
-        f"Processing datasets with {DS_FILE_COUNT_LE_THRESHOLD:,} to {DS_FILE_COUNT_GE_THRESHOLD:,} files."
+        f"Processing datasets with {DS_FILE_COUNT_MIN_THRESHOLD:,} to {DS_FILE_COUNT_MAX_THRESHOLD:,} files."
     )
     return result
 
@@ -469,8 +468,8 @@ def index_published_datasets(
         checkpoint_ids: set,
 ) -> Tuple[List[str], int]:
     es_indices = [
-        f"{config.elastic_search_public_index}_{PARTITION_KEY.lower()}_{DS_FILE_COUNT_LE_THRESHOLD}-{DS_FILE_COUNT_GE_THRESHOLD}",
-        f"{config.elastic_search_private_index}_{PARTITION_KEY.lower()}_{DS_FILE_COUNT_LE_THRESHOLD}-{DS_FILE_COUNT_GE_THRESHOLD}",
+        f"{config.elastic_search_public_index}_{PARTITION_KEY}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}",
+        f"{config.elastic_search_private_index}_{PARTITION_KEY}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}",
     ]
 
     num_errors = 0
@@ -496,9 +495,9 @@ def index_published_datasets(
                 continue
             # Size filter: get file count for this dataset (0 if unknown/NULL uuid)
             ds_file_count = datasets_by_file_count.get(dataset["uuid"], 0)
-            if ds_file_count <= DS_FILE_COUNT_LE_THRESHOLD:
+            if ds_file_count < DS_FILE_COUNT_MIN_THRESHOLD:
                 continue
-            if ds_file_count >= DS_FILE_COUNT_GE_THRESHOLD:
+            if ds_file_count > DS_FILE_COUNT_MAX_THRESHOLD:
                 continue
             if DEBUG_DATASET_UUID_LIST and dataset["uuid"] not in DEBUG_DATASET_UUID_LIST:
                 continue
@@ -699,6 +698,13 @@ def index_published_datasets(
                     logger.error(f"Error flushing remaining inserts for dataset {dataset['uuid']}: {e}")
                     num_errors += 1
 
+            # keep-alive ping to Neo4j after each dataset to prevent connection timeout
+            # between dataset iterations, which can be lengthy for large datasets
+            try:
+                neo4j_session.run("RETURN 1")
+            except Exception as e:
+                logger.warning(f"Neo4j keep-alive ping after dataset {dataset['uuid']} failed: {e}")
+
     return dataset_uuids, num_errors
 
 
@@ -708,7 +714,7 @@ def index_qa_datasets(
         db: Database,
         checkpoint_ids: set,
 ) -> Tuple[List[str], int]:
-    es_indices = [f"{config.elastic_search_private_index}_{PARTITION_KEY.lower()}_{DS_FILE_COUNT_LE_THRESHOLD}-{DS_FILE_COUNT_GE_THRESHOLD}"]
+    es_indices = [f"{config.elastic_search_private_index}_{PARTITION_KEY}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}"]
 
     num_errors = 0
     dataset_uuids = []
@@ -733,9 +739,9 @@ def index_qa_datasets(
                 continue
             # Size filter: get file count for this dataset (0 if unknown/NULL uuid)
             ds_file_count = datasets_by_file_count.get(dataset["uuid"], 0)
-            if ds_file_count <= DS_FILE_COUNT_LE_THRESHOLD:
+            if ds_file_count < DS_FILE_COUNT_MIN_THRESHOLD:
                 continue
-            if ds_file_count >= DS_FILE_COUNT_GE_THRESHOLD:
+            if ds_file_count > DS_FILE_COUNT_MAX_THRESHOLD:
                 continue
             if DEBUG_DATASET_UUID_LIST and dataset["uuid"] not in DEBUG_DATASET_UUID_LIST:
                 continue
@@ -871,6 +877,13 @@ def index_qa_datasets(
                 except Exception as e:
                     logger.error(f"Error flushing remaining inserts for dataset {dataset['uuid']}: {e}")
                     num_errors += 1
+
+            # keep-alive ping to Neo4j after each dataset to prevent connection timeout
+            # between dataset iterations, which can be lengthy for large datasets
+            try:
+                neo4j_session.run("RETURN 1")
+            except Exception as e:
+                logger.warning(f"Neo4j keep-alive ping after dataset {dataset['uuid']} failed: {e}")
 
     return dataset_uuids, num_errors
 
