@@ -479,8 +479,11 @@ def index_published_datasets(
         # Query for primary and processed datasets with a status of Published.
         # Avoid using APOC in the Cypher query so that bad data causing exceptions
         # is handled in Python rather than aborting the Neo4j session.
-        datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['Published'])
-        for raw_record in datasets:
+        # Materialize all results immediately so the Neo4j session is not held open
+        # across the long processing loop, preventing connection timeout errors.
+        datasets = list(neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['Published']))
+        logger.info(f"Retrieved {len(datasets):,} Published datasets from Neo4j.")
+    for raw_record in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
@@ -594,13 +597,6 @@ def index_published_datasets(
 
             es_document_skipped_count = 0
             for idx, (rel_path, local_file) in enumerate(local_filepath_map.items()):
-                if idx > 0 and idx % 100 == 0:
-                    try:
-                        # keep-alive ping to Neo4j to prevent timeout
-                        neo4j_session.run("RETURN 1")
-                    except Exception as e:
-                        logger.warning(f"Neo4j keep-alive ping failed: {e}")
-
                 # skip files already successfully indexed in a previous run of this bootstrap load
                 doc_id = f"{dataset['uuid']}/{rel_path}"
                 if doc_id in checkpoint_ids:
@@ -698,12 +694,7 @@ def index_published_datasets(
                     logger.error(f"Error flushing remaining inserts for dataset {dataset['uuid']}: {e}")
                     num_errors += 1
 
-            # keep-alive ping to Neo4j after each dataset to prevent connection timeout
-            # between dataset iterations, which can be lengthy for large datasets
-            try:
-                neo4j_session.run("RETURN 1")
-            except Exception as e:
-                logger.warning(f"Neo4j keep-alive ping after dataset {dataset['uuid']} failed: {e}")
+
 
     return dataset_uuids, num_errors
 
@@ -723,8 +714,11 @@ def index_qa_datasets(
         # Query for primary and processed datasets with a status of QA or Submitted.
         # Avoid using APOC in the Cypher query so that bad data causing exceptions
         # is handled in Python rather than aborting the Neo4j session.
-        datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted', 'Approval'])
-        for raw_record in datasets:
+        # Materialize all results immediately so the Neo4j session is not held open
+        # across the long processing loop, preventing connection timeout errors.
+        datasets = list(neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted', 'Approval']))
+        logger.info(f"Retrieved {len(datasets):,} QA/Submitted/Approval datasets from Neo4j.")
+    for raw_record in datasets:
             if terminate_event.is_set():
                 logger.info("Termination signal received, stopping indexing.")
                 return dataset_uuids, num_errors
@@ -779,13 +773,6 @@ def index_qa_datasets(
 
             es_document_skipped_count = 0
             for idx, (rel_path, local_file) in enumerate(local_filepath_map.items()):
-                if idx > 0 and idx % 100 == 0:
-                    try:
-                        # keep-alive ping to Neo4j to prevent timeout
-                        neo4j_session.run("RETURN 1")
-                    except Exception as e:
-                        logger.warning(f"Neo4j keep-alive ping failed: {e}")
-
                 # skip files already successfully indexed in a previous run of this bootstrap load
                 doc_id = f"{dataset['uuid']}/{rel_path}"
                 if doc_id in checkpoint_ids:
@@ -878,12 +865,7 @@ def index_qa_datasets(
                     logger.error(f"Error flushing remaining inserts for dataset {dataset['uuid']}: {e}")
                     num_errors += 1
 
-            # keep-alive ping to Neo4j after each dataset to prevent connection timeout
-            # between dataset iterations, which can be lengthy for large datasets
-            try:
-                neo4j_session.run("RETURN 1")
-            except Exception as e:
-                logger.warning(f"Neo4j keep-alive ping after dataset {dataset['uuid']} failed: {e}")
+
 
     return dataset_uuids, num_errors
 
