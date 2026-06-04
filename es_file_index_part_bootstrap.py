@@ -82,16 +82,30 @@ DEBUG_DATASET_UUID_LIST = []
 
 # Partition settings — controls which subset of datasets this instance processes.
 # Each copy of this script should set PARTITION_KEY to one of the keys in PARTITION_CLAUSES.
-# PARTITION_CLAUSES maps a short label to a SQL fragment used by query_files_part().
-# The SQL fragment filters on the 32nd character of dataset_uuid (SUBSTR position 32, 1-indexed).
-# The C-F partition also catches rows where dataset_uuid IS NULL so no rows are lost.
-PARTITION_CLAUSES = {
-    '0-3': "(SUBSTR(dataset_uuid, 32, 1) IN ('0','1','2','3'))",
-    '4-7': "(SUBSTR(dataset_uuid, 32, 1) IN ('4','5','6','7'))",
-    '8-B': "(SUBSTR(dataset_uuid, 32, 1) IN ('8','9','a','b'))",
-    'C-F': "(SUBSTR(dataset_uuid, 32, 1) IN ('c','d','e','f') OR dataset_uuid IS NULL)",
-}
+
 PARTITION_KEY = '0-3'   # set this to the key for this instance
+
+# Character spans for each partition key, used for both Python-side filtering
+# and generating the PARTITION_CLAUSES SQL fragments.
+PARTITION_CHAR_SPANS = {
+    '0-3': {'0', '1', '2', '3'},
+    '4-7': {'4', '5', '6', '7'},
+    '8-B': {'8', '9', 'a', 'b'},
+    'C-F': {'c', 'd', 'e', 'f'},
+}
+
+# SQL fragments generated from PARTITION_CHAR_SPANS.
+# The last partition also catches rows where dataset_uuid could not be identified
+# during the file system crawl, so they are indexed by exactly one partition.
+PARTITION_CLAUSES = {
+    key: f"(SUBSTR(dataset_uuid, 32, 1) IN ({', '.join(repr(c) for c in sorted(chars))}))"
+    for key, chars in PARTITION_CHAR_SPANS.items()
+}
+# Append OR dataset_uuid IS NULL to the last partition so rows where dataset_uuid
+# could not be identified during the file walk are indexed by exactly one partition.
+last_key = list(PARTITION_CLAUSES.keys())[-1]
+PARTITION_CLAUSES[last_key] = PARTITION_CLAUSES[last_key][:-1] + ' OR dataset_uuid IS NULL)'
+
 
 # Cypher query for HuBMAP to get primary and processed Datasets with certain creation_action Activity,
 # supporting substitutable Dataset status value lists for different functions.
@@ -438,9 +452,11 @@ def index_published_datasets(
 
             dataset = parse_dataset_record(raw_record)
             if dataset is None:
-                err_msg = f"Skipping dataset — failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
+                err_msg = f"Skipping dataset - failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
                 logger.error(err_msg)
                 num_errors += 1
+                continue
+            if dataset["uuid"][31] not in PARTITION_CHAR_SPANS[PARTITION_KEY]:
                 continue
             if DEBUG_DATASET_UUID_LIST and dataset["uuid"] not in DEBUG_DATASET_UUID_LIST:
                 continue
@@ -667,9 +683,11 @@ def index_qa_datasets(
 
             dataset = parse_dataset_record(raw_record)
             if dataset is None:
-                err_msg = f"Skipping dataset — failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
+                err_msg = f"Skipping dataset - failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
                 logger.error(err_msg)
                 num_errors += 1
+                continue
+            if dataset["uuid"][31] not in PARTITION_CHAR_SPANS[PARTITION_KEY]:
                 continue
             if DEBUG_DATASET_UUID_LIST and dataset["uuid"] not in DEBUG_DATASET_UUID_LIST:
                 continue
