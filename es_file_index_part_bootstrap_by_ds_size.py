@@ -468,8 +468,8 @@ def index_published_datasets(
         checkpoint_ids: set,
 ) -> Tuple[List[str], int]:
     es_indices = [
-        f"{config.elastic_search_public_index}_{PARTITION_KEY}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}",
-        f"{config.elastic_search_private_index}_{PARTITION_KEY}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}",
+        f"{config.elastic_search_public_index}_{PARTITION_KEY.lower()}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}",
+        f"{config.elastic_search_private_index}_{PARTITION_KEY.lower()}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}",
     ]
 
     num_errors = 0
@@ -705,7 +705,7 @@ def index_qa_datasets(
         db: Database,
         checkpoint_ids: set,
 ) -> Tuple[List[str], int]:
-    es_indices = [f"{config.elastic_search_private_index}_{PARTITION_KEY}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}"]
+    es_indices = [f"{config.elastic_search_private_index}_{PARTITION_KEY.lower()}_{DS_FILE_COUNT_MIN_THRESHOLD}-{DS_FILE_COUNT_MAX_THRESHOLD}"]
 
     num_errors = 0
     dataset_uuids = []
