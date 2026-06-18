@@ -27,7 +27,17 @@ fileIndexingService.ini
 # Rotated log files
 **/*.log*
 
+# All files inside the directory used for logging, but
+# not the directory itself.
+exec_info/**
+!exec_info/.gitkeep
+
+# Directory for the IDE
 .idea
+
+# Project scratch directories
+tmp
+scratch
 
 *.DS_Store
 
@@ -43,7 +53,6 @@ docker/file-indexing-service/BUILD
 
 # Portal cache
 src/hubmap_translation/addl_index_transformations/portal/cache/*.jsonld
-
 
 # python virtual environments
 **/.venv

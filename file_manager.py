@@ -32,6 +32,9 @@ class FileManager:
             dict(),  # mapping of file paths to descriptions
         )
         self._dataset_type_hierarchy_map = None # self._get_dataset_type_hierarchy(ubkg_url, ubkg_application_context, session)
+        # Cache assay type responses keyed by dataset UUID to avoid repeated HTTP calls
+        # to /assaytype/{dataset_uuid} for every file in the same dataset.
+        self._assay_type_cache = {}
 
     def get_additional_info(self, dataset: Record, path: str) -> Optional[dict]:
         if dataset["creation_action"] == "Create Dataset Activity":
@@ -85,8 +88,15 @@ class FileManager:
 
             return info
 
-        elif dataset["creation_action"] == "Central Process":
+        elif dataset["creation_action"] == "Lab Process":
+            # Lab Process datasets are empty shells in Neo4j with no schema, no files,
+            # and no metadata. No further Lab Process datasets are expected.
+            self._logger.warning(f"Ignoring Lab Process dataset {dataset['uuid']} - no indexable content.")
+            return {}
+
+        elif dataset["creation_action"] in ["Central Process", "External Process"]:
             # processed dataset
+            # External Process confirmed equivalent to Central Process (2026-06-17 ADVISE analysis)
             if self._processed_files[0] != dataset["uuid"]:
                 # cache the processed files for this dataset
                 # in the format {rel_path: dict(description, is_data_product, is_qa_qc, data_class)}
@@ -112,14 +122,16 @@ class FileManager:
             raise Exception(f"Unknown creation_action: {dataset['creation_action']}")
 
     def _get_latest_file_schema(self, dataset_uuid: str) -> list[dict]:
-        res = self._session.get(
-            f"{self._ingest_api_url}/assaytype/{dataset_uuid}",
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=TIMEOUT,
-        )
-        if res.status_code != 200:
-            raise Exception(f"Failed to fetch dataset info for UUID: {dataset_uuid}")
-        dir_schema = res.json().get("dir-schema")
+        if dataset_uuid not in self._assay_type_cache:
+            res = self._session.get(
+                f"{self._ingest_api_url}/assaytype/{dataset_uuid}",
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=TIMEOUT,
+            )
+            if res.status_code != 200:
+                raise Exception(f"Failed to fetch dataset info for UUID: {dataset_uuid}")
+            self._assay_type_cache[dataset_uuid] = res.json()
+        dir_schema = self._assay_type_cache[dataset_uuid].get("dir-schema")
         if not dir_schema:
             raise Exception(f"No dir-schema found for Dataset UUID: {dataset_uuid}")
 
