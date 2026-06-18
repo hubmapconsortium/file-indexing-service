@@ -35,7 +35,7 @@ LOG_DIR="${SCRIPT_DIR}/exec_info"
 mkdir -p "${LOG_DIR}"
 
 # Determine execution environment and set PYTHON_CMD accordingly
-VENV_ACTIVATE="${SCRIPT_DIR}/.venv/bin/activate"
+VENV_ACTIVATE="${SCRIPT_DIR}/../.venv/bin/activate"
 if [ -f "${VENV_ACTIVATE}" ]; then
     EXEC_ENV=VENV_ENV
     source "${VENV_ACTIVATE}"
@@ -75,3 +75,4 @@ if [ $? -ne 0 ]; then
 fi
 
 exit_script 0
+
