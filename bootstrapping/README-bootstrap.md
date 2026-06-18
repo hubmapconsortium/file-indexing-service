@@ -57,8 +57,19 @@ Checkpoint files are written to:
 exec_info/bootstrap_checkpoint_{PARTITION_KEY}.txt
 ```
 
-Delete or archive the checkpoint file before starting a fresh bootstrap run. Do not
-delete it when restarting an interrupted run.
+**Starting a fresh bootstrap run:** delete or archive the checkpoint file first,
+otherwise already-indexed documents will be skipped even though the destination
+index is empty.
+
+**Restarting an interrupted run:** leave the checkpoint file in place. The run
+will resume from where it left off, skipping documents already confirmed in ES.
+
+**Note on checkpoint necessity:** with the current 4-partition approach and API
+caching improvements, all four partitions complete in roughly 10-11 hours running
+concurrently. If completion times remain reliable, the checkpoint mechanism may
+be removed in a future version as an unnecessary complexity. It has not been
+exercised in practice -- if you find yourself needing it, verify it works correctly
+before relying on it for a production recovery.
 
 ### Log files
 
@@ -217,14 +228,8 @@ Both files must be present in the working directory.
 
 Scripts in `bootstrapping/` import modules (`database.py`, `file_manager.py`,
 `file_indexing_utils.py`) that live in the parent directory. `file_index_partition_bootstrap.sh`
-sets `PYTHONPATH` automatically. When running Python scripts directly, set it first:
-
-```bash
-cd bootstrapping
-export PYTHONPATH=$(pwd)/..
-```
-
-Or prefix each command:
+sets `PYTHONPATH` inline for the Python process only, so it does not persist in the shell.
+When running Python scripts directly from `bootstrapping/`, prefix each command the same way:
 
 ```bash
 PYTHONPATH=.. .venv/bin/python gap_analysis.py

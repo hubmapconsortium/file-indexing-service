@@ -449,6 +449,11 @@ def parse_dataset_record(record) -> Optional[dict]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint mechanism - may be removed in a future version if bootstrap
+# completion times remain reliable enough that interrupted-run recovery
+# is not needed in practice. The feature has not been exercised.
+# ---------------------------------------------------------------------------
 BOOTSTRAP_CHECKPOINT_FILE = f"exec_info/bootstrap_checkpoint_{PARTITION_KEY}.txt"
 
 
