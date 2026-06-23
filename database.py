@@ -12,6 +12,24 @@ VersionedFileInfo = namedtuple("VersionedFileInfo", ["path", "version", "aws_ver
 logger = logging.getLogger("database")
 
 
+def _prefix_upper_bound(path_prefix: str) -> str:
+    """Return the smallest string strictly greater than every string beginning with
+    path_prefix, so that `path >= path_prefix AND path < upper_bound` selects exactly
+    the rows that `path LIKE path_prefix || '%'` would.
+
+    This lets the idx_files_path index perform an indexed range SEARCH (seek to this
+    dataset's slice of the index) instead of a full index SCAN. A prefix LIKE in the
+    GROUP BY subquery was being executed as a full scan of all ~11.6M index entries on
+    every call, which dominated the nightly runtime (a ~1.4s floor per call regardless
+    of dataset size; ~8 hours total across ~11k datasets). EXPLAIN QUERY PLAN confirmed
+    the range form converts that subquery SCAN into a SEARCH.
+
+    path_prefix is always a non-empty globus dataset path here. The upper bound is the
+    prefix with its final character incremented by one code point.
+    """
+    return path_prefix[:-1] + chr(ord(path_prefix[-1]) + 1)
+
+
 class Database:
     def __init__(self, db_path: str, read_only: bool = False):
         if read_only:
@@ -109,40 +127,61 @@ class Database:
             logger.error(f"Database insert error: {e}")
 
     def query_files(self, path_prefix: str) -> List[DBFile]:
+        # Use a half-open prefix range [path_prefix, upper) instead of LIKE so the
+        # idx_files_path index performs a SEARCH rather than a full index SCAN.
+        # See _prefix_upper_bound for the full rationale.
+        #
+        # ROW_NUMBER() picks exactly one row per path: the newest by last_modified_at,
+        # breaking ties by version (the schema is PRIMARY KEY (path, version), so the
+        # highest version is the genuinely newest row). This replaces an earlier
+        # (path, last_modified_at) IN (SELECT path, MAX(last_modified_at) GROUP BY path)
+        # form, which on a last_modified_at tie returned BOTH rows for a path and let a
+        # downstream dict key collision pick between them nondeterministically.
+        upper_bound = _prefix_upper_bound(path_prefix)
         query = """
-            SELECT path, size, last_modified_at
-            FROM files
-            WHERE (path, last_modified_at) IN (
-                SELECT path, MAX(last_modified_at)
+            SELECT path, size, last_modified_at FROM (
+                SELECT path, size, last_modified_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY path
+                           ORDER BY last_modified_at DESC, version DESC
+                       ) AS rn
                 FROM files
-                WHERE path LIKE ?
-                GROUP BY path
+                WHERE path >= ? AND path < ?
             )
+            WHERE rn = 1
         """
         return [
             DBFile(row[0], os.path.relpath(row[0], path_prefix), row[1], row[2])
-            for row in self.conn.execute(query, (f"{path_prefix}%",))
+            for row in self.conn.execute(query, (path_prefix, upper_bound))
         ]
 
     def query_files_part(self, path_prefix: str, partition_clause: str) -> List[DBFilePart]:
         """Query files by path prefix, filtered by a SQL clause from PARTITION_CLAUSES.
-        Used by es_file_index_part_bootstrap.py to limit each instance to its assigned
-        partition of dataset UUIDs. The clause is injected directly into the query —
-        callers must only pass values from the hardcoded PARTITION_CLAUSES dict."""
+        Used by es_file_index_partition_bootstrap.py to limit each instance to its
+        assigned partition of dataset UUIDs. The clause is injected directly into the
+        query — callers must only pass values from the hardcoded PARTITION_CLAUSES dict.
+
+        Uses a half-open prefix range [path_prefix, upper) instead of LIKE so the
+        idx_files_path index performs a SEARCH rather than a full index SCAN.
+        See _prefix_upper_bound for the full rationale. ROW_NUMBER() picks exactly one
+        row per path (newest by last_modified_at, ties broken by version)."""
+        upper_bound = _prefix_upper_bound(path_prefix)
         query = f"""
-            SELECT path, size, last_modified_at, dataset_uuid
-            FROM files
-            WHERE (path, last_modified_at) IN (
-                SELECT path, MAX(last_modified_at)
+            SELECT path, size, last_modified_at, dataset_uuid FROM (
+                SELECT path, size, last_modified_at, dataset_uuid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY path
+                           ORDER BY last_modified_at DESC, version DESC
+                       ) AS rn
                 FROM files
-                WHERE path LIKE ?
+                WHERE path >= ? AND path < ?
                 AND {partition_clause}
-                GROUP BY path
             )
+            WHERE rn = 1
         """
         return [
             DBFilePart(row[0], os.path.relpath(row[0], path_prefix), row[1], row[2], row[3])
-            for row in self.conn.execute(query, (f"{path_prefix}%",))
+            for row in self.conn.execute(query, (path_prefix, upper_bound))
         ]
 
     def count_files(self, since: int) -> int:

@@ -1,3 +1,10 @@
+######################################################################################################################
+# Regular incremental maintenance of the ElasticSearch indices of file-indexing-service.                             #
+# Processes changed rows of the SQLite database built by local_file_index.py.                                        #
+# Delete and upsert to maintain the hm_consortium_files and hm_public_files indices.                                 #
+#                                                                                                                    #
+# SQLite database is opened read-only - this process never writes to SQLite.                                         #
+######################################################################################################################
 import sys
 import ast
 import hashlib
@@ -12,14 +19,14 @@ import time
 from argparse import ArgumentParser
 from collections import namedtuple
 from configparser import ConfigParser
-from typing import Optional, Union #, LiteralString
+from pathlib import Path
+from typing import Optional, Union, List, Tuple #, LiteralString
 # While we're still using a Python 3.9 interpreter prior to upgrading our
 # platform, alias LiteralString as needed to satisfy static type checking.
 if sys.version_info >= (3, 11):
     from typing import LiteralString
 else:
     LiteralString = str
-from pathlib import Path
 
 from neo4j import Driver, GraphDatabase, Record
 from requests import Session
@@ -30,6 +37,7 @@ from urllib3.util.retry import Retry
 from database import Database, DBFile
 from file_manager import FileManager
 from file_indexing_utils import FileIndexingUtils
+from timed_step import TimedStep
 
 Config = namedtuple(
     "Config",
@@ -37,6 +45,7 @@ Config = namedtuple(
         "database",
         "log_id",
         "log_level",
+        "service_config",
         "elastic_search_url",
         "elastic_search_public_index",
         "elastic_search_private_index",
@@ -59,12 +68,21 @@ UUIDFileInfo = namedtuple(
     "UUIDFileInfo", ["path", "md5_checksum", "sha256_checksum", "base_dir", "size"]
 )
 
-# Cypher query for HuBMAP to get primary and processed Datasets with certain creation_action Activity, and
-# supporting substitutable Dataset status value lists for different functions.
-# Note: ds.metadata and ds.files are returned as raw strings rather than parsed via APOC.
-# This avoids Neo.ClientError.Procedure.ProcedureCallFailed errors caused by invalid JSON
-# (e.g. unescaped control characters) in individual dataset records which would otherwise
-# kill the entire Neo4j session. Parsing is done per-record in Python instead.
+# When es_upserts reaches this size during a dataset's per-file loop, flush to
+# ElasticSearch immediately rather than waiting for the end of the dataset. This
+# bounds memory usage for datasets with very large file counts.
+FLUSH_ES_DOCS_LEVEL = 1000
+
+# Each flush to ElasticSearch is performed in chunks with this many bulk operations
+# per Bulk API call, to stay within request size limits.
+FLUSH_ES_DOCS_CHUNK_SIZE = 100
+
+# Cypher query base for HuBMAP datasets.
+# ds.metadata and ds.files are returned as raw strings rather than parsed via APOC
+# to avoid Neo.ClientError.Procedure.ProcedureCallFailed errors from invalid JSON
+# in individual dataset records killing the entire Neo4j session.
+# ORDER BY rand() is intentionally omitted to avoid forcing Neo4j to materialize the full result set
+# before streaming, which is extremely slow for large graphs.
 DATASETS_TO_INDEX_QUERY: LiteralString = """
     MATCH (donor:Donor)-[:ACTIVITY_INPUT]->(organ_activity:Activity)-[:ACTIVITY_OUTPUT]->(organ:Sample {sample_category:'organ'})-[*]->(a:Activity)-[:ACTIVITY_OUTPUT]->(ds:Dataset)
     WHERE a.creation_action IN ['Create Dataset Activity', 'Central Process','Lab Process','External Process']
@@ -78,7 +96,6 @@ DATASETS_TO_INDEX_QUERY: LiteralString = """
     a.creation_action AS creation_action,
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'entity_type', donor.entity_type])) AS donors,
     COLLECT(apoc.map.fromValues(['uuid', donor.uuid, 'code', organ.organ])) AS organs
-    ORDER BY rand()
 """
 
 log_file_name = "Log filename not set"
@@ -86,19 +103,32 @@ logger = logging.getLogger("es-file-index")
 
 
 def parse_config() -> Config:
-    parser = ArgumentParser(description="Index file info to Elastic Search.")
+    parser = ArgumentParser(description="Index file info from SQLite into Elastic Search.")
     parser.add_argument(
         "--config", default="config.ini", help="Path to the configuration file (ini format)"
     )
+    parser.add_argument(
+        "--service-config", default="fileIndexingService.ini",
+        help="Path to the fileIndexingService.ini configuration file"
+    )
     args = parser.parse_args()
+
+    if not Path(args.config).exists():
+        print(f"ERROR: config file not found: {args.config}")
+        sys.exit(2)
 
     c = ConfigParser()
     c.read(args.config)
+
+    if not Path(args.service_config).exists():
+        print(f"ERROR: service config file not found: {args.service_config}")
+        sys.exit(2)
 
     return Config(
         database=c.get("Local", "DATABASE_FILEPATH", fallback="local_file_index.db"),
         log_id=c.get("DEFAULT", "LOG_ID", fallback="default"),
         log_level=c.get("Local", "LOG_LEVEL", fallback="info"),
+        service_config=args.service_config,
         elastic_search_url=c.get("ElasticSearch", "ELASTIC_SEARCH_URL"),
         elastic_search_public_index=c.get("ElasticSearch", "ELASTIC_SEARCH_PUBLIC_INDEX"),
         elastic_search_private_index=c.get("ElasticSearch", "ELASTIC_SEARCH_PRIVATE_INDEX"),
@@ -119,7 +149,8 @@ def parse_config() -> Config:
 
 def setup_logger(log_id: str, log_level: str):
     global log_file_name
-
+    # exec_info is created relative to the current working directory, which the
+    # shell script sets via cd "${SCRIPT_DIR}".
     if not os.path.exists("exec_info"):
         os.makedirs("exec_info")
 
@@ -139,7 +170,7 @@ config = parse_config()
 setup_logger(config.log_id, config.log_level)
 service_utils = None
 try:
-    service_utils = FileIndexingUtils(config_file_name=Path('fileIndexingService.ini')
+    service_utils = FileIndexingUtils(config_file_name=Path(config.service_config)
                                       , disable_slack_notifications=(config.slack_notifications == 'DISABLED'))
     print('FileIndexingUtils instantiated.')
 except Exception as e:
@@ -177,7 +208,8 @@ except Exception as e:
                                       , process_bad_news_emoji=':bangbang:'
                                       , exit_code=3)
 
-def get_ubkg_organs() -> list[dict]:
+
+def get_ubkg_organs() -> List[dict]:
     res = session.get(url=f"{config.ubkg_url}/organs?application_context={config.ubkg_application_context}",
                       timeout=TIMEOUT)
     if res.status_code != 200:
@@ -185,7 +217,8 @@ def get_ubkg_organs() -> list[dict]:
         raise Exception(msg)
     return res.json()
 
-def get_files_from_uuid_api(dataset_uuid: str) -> list[dict]:
+
+def get_files_from_uuid_api(dataset_uuid: str) -> List[dict]:
     res = session.get(
         f"{config.uuid_api_url}/{dataset_uuid}/files",
         headers={"Authorization": f"Bearer {config.globus_groups_token}"},
@@ -205,6 +238,7 @@ def get_files_from_uuid_api(dataset_uuid: str) -> list[dict]:
                   f" {config.uuid_api_url}/{dataset_uuid}/files"
     raise Exception(err_msg)
 
+
 def get_dataset_globus_path(dataset: Record) -> str:
     if dataset["contains_human_genetic_sequences"] is True:
         return os.path.join(
@@ -219,7 +253,7 @@ def get_dataset_globus_path(dataset: Record) -> str:
     )
 
 
-def get_docs_from_es(index: str, dataset_uuid: str, fields: list[str]) -> list[dict]:
+def get_docs_from_es(index: str, dataset_uuid: str, fields: List[str]) -> List[dict]:
     scroll = "1m"  # save scroll context for 1 minute
     size = 10000
     docs = []
@@ -231,41 +265,49 @@ def get_docs_from_es(index: str, dataset_uuid: str, fields: list[str]) -> list[d
         "size": size,
         "query": {"term": {"dataset_uuid": dataset_uuid}},
     }
-    res = session.post(search_url, json=query, timeout=TIMEOUT)
-    res.raise_for_status()
-    data = res.json()
-    scroll_id = data["_scroll_id"]
-    hits = data["hits"]["hits"]
-    docs.extend(
-        {"_id": hit["_id"], **{field: hit["_source"].get(field) for field in fields}}
-        for hit in hits
-    )
-
-    # scroll until no more hits
-    while hits:
-        scroll_resp = session.post(
-            f"{config.elastic_search_url}/_search/scroll",
-            json={"scroll": scroll, "scroll_id": scroll_id},
-            timeout=TIMEOUT,
-        )
-        scroll_resp.raise_for_status()
-        scroll_data = scroll_resp.json()
-        hits = scroll_data["hits"]["hits"]
-        if not hits:
-            break
+    with TimedStep(logger, f"ES scroll search for dataset {dataset_uuid} in {index}"):
+        res = session.post(search_url, json=query, timeout=TIMEOUT)
+        res.raise_for_status()
+        data = res.json()
+        scroll_id = data["_scroll_id"]
+        hits = data["hits"]["hits"]
         docs.extend(
             {"_id": hit["_id"], **{field: hit["_source"].get(field) for field in fields}}
             for hit in hits
         )
-        scroll_id = scroll_data["_scroll_id"]
-        time.sleep(1)
+
+        # scroll until no more hits
+        while hits:
+            scroll_resp = session.post(
+                f"{config.elastic_search_url}/_search/scroll",
+                json={"scroll": scroll, "scroll_id": scroll_id},
+                timeout=TIMEOUT,
+            )
+            scroll_resp.raise_for_status()
+            scroll_data = scroll_resp.json()
+            hits = scroll_data["hits"]["hits"]
+            if not hits:
+                break
+            docs.extend(
+                {"_id": hit["_id"], **{field: hit["_source"].get(field) for field in fields}}
+                for hit in hits
+            )
+            scroll_id = scroll_data["_scroll_id"]
+            time.sleep(1)
 
     return docs
 
 
+def _chunked(seq, size):
+    """Yield successive slices of seq of at most size items. The final slice
+    carries the remainder, so a consuming loop needs no post-loop cleanup."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def bulk_update_es_indices(
-        indices: Union[str, list[str]], upserts: list[dict], deletes: list[dict]
-) -> Optional[list[str]]:
+        indices: Union[str, List[str]], upserts: List[dict], deletes: List[dict]
+) -> Optional[List[str]]:
     if isinstance(indices, str):
         indices = [indices]
 
@@ -273,6 +315,8 @@ def bulk_update_es_indices(
     updates = [
         f'{{"delete":{{"_id":"{doc["dataset_uuid"]}/{doc["rel_path"]}"}}}}' for doc in deletes
     ]
+    """Send documents to one or more ElasticSearch indices using the bulk API.
+    Uses doc_as_upsert=true - ES inserts if the document does not exist, updates if it does."""
     updates.extend(
         [
             f'{{"update":{{"_id":"{doc["dataset_uuid"]}/{doc["rel_path"]}"}}}}\n{{"doc":{json.dumps(doc, separators=(",", ":"))},"doc_as_upsert":true}}'
@@ -280,79 +324,81 @@ def bulk_update_es_indices(
         ]
     )
 
-    # split upserts into chunks to avoid exceeding the request size limit. 100 is arbitrary
+    # split updates into chunks to avoid exceeding the request size limit.
+    # _chunked yields one slice at a time so no full list-of-chunks is materialized.
     error_msgs = []
-    chunk_size = 100
-    chunks = [updates[i: i + chunk_size] for i in range(0, len(updates), chunk_size)]
-    for chunk in chunks:
-        body = "\n".join(chunk) + "\n"
-        for index in indices:
-            url = f"{config.elastic_search_url}/{index}/_bulk"
-            res = session.post(
-                url,
-                headers={"Content-Type": "application/x-ndjson"},
-                data=body,
-                timeout=TIMEOUT,
-            )
-            if res.status_code != 200:
-                raise Exception(
-                    f"Error indexing documents for dataset in {index}: "
-                    f"{res.status_code}, {res.text}"
+    with TimedStep(logger, f"ES bulk update {len(updates)} ops across {len(indices)} indices"):
+        for chunk in _chunked(updates, FLUSH_ES_DOCS_CHUNK_SIZE):
+            body = "\n".join(chunk) + "\n"
+            for index in indices:
+                url = f"{config.elastic_search_url}/{index}/_bulk"
+                res = session.post(
+                    url,
+                    headers={"Content-Type": "application/x-ndjson"},
+                    data=body,
+                    timeout=TIMEOUT,
                 )
+                if res.status_code != 200:
+                    raise Exception(
+                        f"Error inserting documents for dataset in {index}: "
+                        f"{res.status_code}, {res.text}"
+                    )
 
-            res_body = res.json().get("items", [])
-            result_values = [item.get("update") for item in res_body if "update" in item]
-            msgs = [
-                f"{item['_id']}: Update - {item.get('error', {}).get('reason')}"
-                for item in result_values
-                if item["status"] not in [200, 201]
-            ]
-            if msgs:
-                error_msgs.extend(msgs)
+                res_body = res.json().get("items", [])
+                result_values = [item.get("update") for item in res_body if "update" in item]
+                msgs = [
+                f"{item['_id']}: Insert - {item.get('error', {}).get('reason')}"
+                    for item in result_values
+                    if item["status"] not in [200, 201]
+                ]
+                if msgs:
+                    error_msgs.extend(msgs)
 
     return error_msgs if error_msgs else None
 
 
-def delete_by_query_es_indices(indices: Union[str, list[str]], query: dict):
+def delete_by_query_es_indices(indices: Union[str, List[str]], query: dict):
     if isinstance(indices, str):
         indices = [indices]
 
     for index in indices:
         url = f"{config.elastic_search_url}/{index}/_delete_by_query"
-        res = session.post(url, json=query, timeout=TIMEOUT)
-        res.raise_for_status()
-        return res.json()
+        with TimedStep(logger, f"ES delete_by_query on {index}"):
+            res = session.post(url, json=query, timeout=TIMEOUT)
+            res.raise_for_status()
+            return res.json()
 
 
 def bulk_create_file_uuids(
-        file_info: Union[list[UUIDFileInfo], tuple[UUIDFileInfo]], parent_uuid: str
+        file_info: Union[List[UUIDFileInfo], Tuple[UUIDFileInfo]], parent_uuid: str
 ):
     # split upserts into chunks to avoid exceeding gateway timeouts
     chunk_size = 1000
     chunks = [file_info[i: i + chunk_size] for i in range(0, len(file_info), chunk_size)]
     error = None
-    for idx, chunk in enumerate(chunks):
-        res = session.post(
-            f"{config.uuid_api_url}/uuid?entity_count={len(chunk)}",
-            headers={"Authorization": f"Bearer {config.globus_groups_token}"},
-            json={
-                "entity_type": "FILE",
-                "parent_ids": [parent_uuid],
-                "file_info": [item._asdict() for item in chunk],
-            },
-            timeout=TIMEOUT,
-        )
-        if res.status_code != 200:
-            error = f"Error creating file uuids in uuid-api: {res.status_code}, {res.text}"
+    with TimedStep(logger, f"UUID API bulk_create {len(file_info)} file uuids for {parent_uuid}"):
+        for idx, chunk in enumerate(chunks):
+            res = session.post(
+                f"{config.uuid_api_url}/uuid?entity_count={len(chunk)}",
+                headers={"Authorization": f"Bearer {config.globus_groups_token}"},
+                json={
+                    "entity_type": "FILE",
+                    "parent_ids": [parent_uuid],
+                    "file_info": [item._asdict() for item in chunk],
+                },
+                timeout=TIMEOUT,
+            )
+            if res.status_code != 200:
+                error = f"Error creating file uuids in uuid-api: {res.status_code}, {res.text}"
 
-        if idx < len(chunks) - 1:
-            time.sleep(1)
+            if idx < len(chunks) - 1:
+                time.sleep(1)
 
     if error:
         raise Exception(error)
 
 
-def generate_checksums(filepath: str) -> tuple[str, str]:
+def generate_checksums(filepath: str) -> Tuple[str, str]:
     md5 = hashlib.md5()
     sha256 = hashlib.sha256()
     read_size = 65536
@@ -385,7 +431,7 @@ def get_organ_hierarchy(organ: dict) -> str:
 
 def parse_dataset_record(record) -> Optional[dict]:
     """Parse a raw Neo4j dataset record, converting metadata_str and files_str from
-    JSON strings to Python objects. Returns None if the record cannot be parsed,
+    Python repr strings to Python objects. Returns None if the record cannot be parsed,
     allowing the caller to skip it without aborting the entire result set."""
     try:
         dataset = dict(record)
@@ -396,7 +442,7 @@ def parse_dataset_record(record) -> Optional[dict]:
         return dataset
     except Exception as e:
         uuid = dict(record).get("uuid", "unknown")
-        logger.error(f"Skipping dataset {uuid} — failed to parse record: {e}")
+        logger.error(f"Skipping dataset {uuid} - failed to parse record: {e}")
         return None
 
 
@@ -404,7 +450,7 @@ def index_published_datasets(
         ubkg_organs: dict,
         driver: Driver,
         db: Database,
-) -> tuple[list[str], int]:
+) -> Tuple[List[str], int]:
     es_indices = [config.elastic_search_public_index, config.elastic_search_private_index]
 
     num_errors = 0
@@ -422,7 +468,7 @@ def index_published_datasets(
 
             dataset = parse_dataset_record(raw_record)
             if dataset is None:
-                err_msg = f"Skipping dataset — failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
+                err_msg = f"Skipping dataset - failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
                 logger.error(err_msg)
                 num_errors += 1
                 continue
@@ -450,11 +496,12 @@ def index_published_datasets(
             try:
                 # get files in local database for the dataset, filter out files with blank or
                 # numeric extensions
-                local_filepath_map = {
-                    file.rel_path: file
-                    for file in db.query_files(dataset_globus_path)
-                    if (ext := os.path.splitext(file.path)[1]) and not re.match(r"^\.\d+$", ext)
-                }
+                with TimedStep(logger, f"SQLite query_files for dataset {dataset['uuid']}"):
+                    local_filepath_map = {
+                        file.rel_path: file
+                        for file in db.query_files(dataset_globus_path)
+                        if (ext := os.path.splitext(file.path)[1]) and not re.match(r"^\.\d+$", ext)
+                    }
             except Exception as e:
                 logger.error(
                     f"Error fetching files from local database for dataset {dataset['uuid']}: {e}"
@@ -464,10 +511,11 @@ def index_published_datasets(
 
             try:
                 # get files in uuid-api for the dataset
-                uuid_filepath_map = {
-                    item["path"]: item
-                    for item in get_files_from_uuid_api(dataset_uuid=dataset["uuid"])
-                }
+                with TimedStep(logger, f"UUID API fetch for dataset {dataset['uuid']}"):
+                    uuid_filepath_map = {
+                        item["path"]: item
+                        for item in get_files_from_uuid_api(dataset_uuid=dataset["uuid"])
+                    }
             except Exception as e:
                 logger.error(
                     f"Error fetching files from UUID API for dataset {dataset['uuid']}: {e}"
@@ -478,17 +526,24 @@ def index_published_datasets(
             # log the files that are in uuid-api but not in the local database
             diff_uuid_files = set(uuid_filepath_map.keys()) - set(local_filepath_map.keys())
             if diff_uuid_files:
+                sorted_diff = sorted(diff_uuid_files)
+                if len(sorted_diff) <= 2:
+                    diff_str = ', '.join(sorted_diff)
+                else:
+                    diff_str = f"{sorted_diff[0]},...,{sorted_diff[-1]}"
                 logger.warning(
-                    f"Files in UUID API but not in local database for dataset {dataset['uuid']}: "
-                    f"{', '.join(diff_uuid_files)}"
+                    f"UUID API returns {len(sorted_diff)} files not in local database for Dataset {dataset['uuid']}: {diff_str}"
                 )
 
             try:
                 # get files that are in the database but not the uuid-api
                 diff_uuid_files = set(local_filepath_map.keys()) - set(uuid_filepath_map.keys())
+                logger.debug(f"For {str(len(diff_uuid_files))} files in the database for the local filesystem but"
+                             f" not known by UUID API, gather file info.")
                 file_info = [
                     create_file_info(local_filepath_map[filepath]) for filepath in diff_uuid_files
                 ]
+                logger.debug(f"Gathered info for {str(len(file_info))} files to add to UUID API.")
             except Exception as e:
                 logger.error(
                     "Error creating file info for UUID API creation for dataset "
@@ -535,89 +590,153 @@ def index_published_datasets(
                 num_errors += 1
                 continue
 
-            # delete files in elastic search that are not in the local database
+            # Phase 1: delete files in elastic search that are not in the local
+            # database. The delete set can be very large (e.g. a researcher zipping
+            # millions of zarr files into a single zarr.zip), so accumulate and flush
+            # in bounded batches rather than holding the whole list in memory.
             diff_es_files = set(es_filepath_map.keys()) - set(local_filepath_map.keys())
             if diff_es_files:
                 logger.info(
                     f"Deleting {len(diff_es_files)} files from ES for dataset {dataset['uuid']}"
                 )
-                es_deletes.extend(
-                    [
-                        {
-                            "dataset_uuid": dataset["uuid"],
-                            "rel_path": filepath,
-                        }
-                        for filepath in diff_es_files
-                    ]
-                )
-
-            for idx, (rel_path, local_file) in enumerate(local_filepath_map.items()):
-                if idx > 0 and idx % 100 == 0:
-                    try:
-                        # keep-alive ping to Neo4j to prevent timeout
-                        neo4j_session.run("RETURN 1")
-                    except Exception as e:
-                        logger.warning(f"Neo4j keep-alive ping failed: {e}")
-
-                uuid_file = uuid_filepath_map[rel_path]
-
-                # check if the file is in elastic search
-                es_file = es_filepath_map.get(rel_path)
-                needs_upsert = (
-                        es_file is None
-                        or es_file.get("file_uuid") is None
-                        or local_file.last_modified_at != es_file["last_modified_at"]
-                        or local_file.size != es_file["size"]
-                )
-                if needs_upsert:
-                    # insert or update the file in elastic search
-                    file_ext = os.path.splitext(local_file.path)[1].lower()
-                    additional_info = None
-                    try:
-                        additional_info = file_manager.get_additional_info(
-                            dataset=dataset,
-                            path=rel_path,
+                with TimedStep(logger, f"Delete loop for dataset {dataset['uuid']} ({len(diff_es_files)} files)"):
+                    for filepath in diff_es_files:
+                        es_deletes.append(
+                            {
+                                "dataset_uuid": dataset["uuid"],
+                                "rel_path": filepath,
+                            }
                         )
+
+                        if len(es_deletes) >= FLUSH_ES_DOCS_LEVEL:
+                            try:
+                                logger.info(
+                                    f"Flushing {len(es_deletes)} deletes to ES "
+                                    f"(mid-dataset flush for dataset {dataset['uuid']})"
+                                )
+                                with TimedStep(logger, f"ES bulk delete {len(es_deletes)} docs (mid-dataset flush)"):
+                                    err_msgs = bulk_update_es_indices(
+                                        indices=es_indices, upserts=[], deletes=es_deletes
+                                    )
+                                if err_msgs:
+                                    for msg in err_msgs:
+                                        logger.error(f"Error deleting document: {msg}")
+                                es_deletes = []
+                            except Exception as e:
+                                logger.error(
+                                    f"Error flushing deletes to ES for dataset {dataset['uuid']}: {e}"
+                                )
+                                num_errors += 1
+
+                # flush any remaining deletes below the threshold
+                if es_deletes:
+                    try:
+                        with TimedStep(logger, f"ES bulk delete {len(es_deletes)} docs (delete remainder)"):
+                            err_msgs = bulk_update_es_indices(
+                                indices=es_indices, upserts=[], deletes=es_deletes
+                            )
+                        if err_msgs:
+                            for msg in err_msgs:
+                                logger.error(f"Error deleting document: {msg}")
+                        es_deletes = []
                     except Exception as e:
-                        logger.error(
-                            f"Error fetching file description for {local_file.rel_path} in dataset "
-                            f"{dataset['uuid']}: {e}"
-                        )
+                        logger.error(f"Error flushing remaining deletes for dataset {dataset['uuid']}: {e}")
                         num_errors += 1
 
-                    logger.info(
-                        f"Buffering ES Document for upsert for file {local_file.rel_path} in Dataset {dataset['uuid']}"
+            # Phase 2: upsert files from the local database. Flush in bounded batches
+            # to keep memory flat for datasets with very large file counts.
+            with TimedStep(logger, f"Build upserts loop for dataset {dataset['uuid']} ({len(local_filepath_map)} files)"):
+                for idx, (rel_path, local_file) in enumerate(local_filepath_map.items()):
+                    if idx > 0 and idx % 100 == 0:
+                        try:
+                            # keep-alive ping to Neo4j to prevent timeout
+                            neo4j_session.run("RETURN 1")
+                        except Exception as e:
+                            logger.warning(f"Neo4j keep-alive ping failed: {e}")
+
+                    uuid_file = uuid_filepath_map[rel_path]
+
+                    # check if the file is in elastic search
+                    es_file = es_filepath_map.get(rel_path)
+                    needs_upsert = (
+                            es_file is None
+                            or es_file.get("file_uuid") is None
+                            or local_file.last_modified_at != es_file["last_modified_at"]
+                            or local_file.size != es_file["size"]
                     )
-                    doc = {
-                        "sha256_checksum": uuid_file["sha256_checksum"],
-                        "md5_checksum": uuid_file["md5_checksum"],
-                        "dataset_uuid": dataset["uuid"],
-                        "dataset_hubmap_id": dataset["hubmap_id"],
-                        "dataset_status": dataset["status"],
-                        "dataset_type": dataset["dataset_type"],
-                        "data_access_level": dataset["data_access_level"],
-                        "file_extension": file_ext,
-                        "file_uuid": uuid_file["file_uuid"],
-                        "organs": organs,
-                        "rel_path": uuid_file["path"],
-                        "size": uuid_file["size"],
-                        "donors": dataset["donors"],
-                        "last_modified_at": local_file.last_modified_at,
-                    }
-                    if additional_info is not None:
-                        doc.update(additional_info)
+                    if needs_upsert:
+                        # insert or update the file in elastic search
+                        file_ext = os.path.splitext(local_file.path)[1].lower()
+                        additional_info = None
+                        try:
+                            with TimedStep(logger, f"get_additional_info for {rel_path} in dataset {dataset['uuid']}"):
+                                additional_info = file_manager.get_additional_info(
+                                    dataset=dataset,
+                                    path=rel_path,
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"Error fetching file description for {local_file.rel_path} in dataset "
+                                f"{dataset['uuid']}: {e}"
+                            )
+                            num_errors += 1
 
-                    es_upserts.append(doc)
+                        logger.info(
+                            f"Buffering ES Document for upsert for file {local_file.rel_path} in Dataset {dataset['uuid']}"
+                        )
+                        doc = {
+                            "sha256_checksum": uuid_file["sha256_checksum"],
+                            "md5_checksum": uuid_file["md5_checksum"],
+                            "dataset_uuid": dataset["uuid"],
+                            "dataset_hubmap_id": dataset["hubmap_id"],
+                            "dataset_status": dataset["status"],
+                            "dataset_type": dataset["dataset_type"],
+                            "data_access_level": dataset["data_access_level"],
+                            "file_extension": file_ext,
+                            "file_uuid": uuid_file["file_uuid"],
+                            "organs": organs,
+                            "rel_path": uuid_file["path"],
+                            "size": uuid_file["size"],
+                            "donors": dataset["donors"],
+                            "last_modified_at": local_file.last_modified_at,
+                        }
+                        if additional_info is not None:
+                            doc.update(additional_info)
 
-            # bulk update elastic search indices if necessary
-            if es_upserts or es_deletes:
+                        es_upserts.append(doc)
+
+                    if len(es_upserts) >= FLUSH_ES_DOCS_LEVEL:
+                        try:
+                            logger.info(
+                                f"Flushing {len(es_upserts)} upserts to ES "
+                                f"(mid-dataset flush at file {idx + 1} of {len(local_filepath_map)} "
+                                f"for dataset {dataset['uuid']})"
+                            )
+                            with TimedStep(logger, f"ES bulk upsert {len(es_upserts)} docs (mid-dataset flush)"):
+                                err_msgs = bulk_update_es_indices(
+                                    indices=es_indices, upserts=es_upserts, deletes=[]
+                                )
+                            if err_msgs:
+                                for msg in err_msgs:
+                                    logger.error(f"Error indexing document: {msg}")
+                            es_upserts = []
+                        except Exception as e:
+                            logger.error(
+                                f"Error flushing upserts to ES for dataset {dataset['uuid']}: {e}"
+                            )
+                            num_errors += 1
+
+            # flush any remaining upserts below the threshold
+            if es_upserts:
                 try:
-                    err_msgs = bulk_update_es_indices(
-                        indices=es_indices, upserts=es_upserts, deletes=es_deletes
-                    )
+                    with TimedStep(logger, f"ES bulk upsert {len(es_upserts)} docs (upsert remainder)"):
+                        err_msgs = bulk_update_es_indices(
+                            indices=es_indices, upserts=es_upserts, deletes=[]
+                        )
                     if err_msgs:
                         for msg in err_msgs:
                             logger.error(f"Error indexing document: {msg}")
+                    es_upserts = []
                 except Exception as e:
                     logger.error(f"Error indexing documents for dataset {dataset['uuid']}: {e}")
                     num_errors += 1
@@ -625,7 +744,7 @@ def index_published_datasets(
     return dataset_uuids, num_errors
 
 
-def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[list[str], int]:
+def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> Tuple[List[str], int]:
     es_indices = [config.elastic_search_private_index]
 
     num_errors = 0
@@ -635,7 +754,6 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
         #
         # Avoid using APOC in Neo4j Cypher query so that bad data which causes Exceptions to be
         # thrown are handled in this script rather than from server.
-        # KBKBKB @TODO - confirm 'Approval' goes here and not with 'Published'
         datasets = neo4j_session.run(DATASETS_TO_INDEX_QUERY, statuses=['QA', 'Submitted', 'Approval'])
         for raw_record in datasets:
             if terminate_event.is_set():
@@ -644,7 +762,7 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
 
             dataset = parse_dataset_record(raw_record)
             if dataset is None:
-                err_msg = f"Skipping dataset — failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
+                err_msg = f"Skipping dataset - failed to parse Neo4j record for uuid: {dict(raw_record).get('uuid', 'unknown')}"
                 logger.error(err_msg)
                 num_errors += 1
                 continue
@@ -672,11 +790,12 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
             try:
                 # get files in local database for the dataset, filter out files with blank or
                 # numeric extensions
-                local_filepath_map = {
-                    file.rel_path: file
-                    for file in db.query_files(dataset_globus_path)
-                    if (ext := os.path.splitext(file.path)[1]) and not re.match(r"^\.\d+$", ext)
-                }
+                with TimedStep(logger, f"SQLite query_files for dataset {dataset['uuid']}"):
+                    local_filepath_map = {
+                        file.rel_path: file
+                        for file in db.query_files(dataset_globus_path)
+                        if (ext := os.path.splitext(file.path)[1]) and not re.match(r"^\.\d+$", ext)
+                    }
             except Exception as e:
                 logger.error(
                     f"Error fetching files from local database for dataset {dataset['uuid']}: {e}"
@@ -698,106 +817,168 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> tuple[
                 logger.error(
                     f"Error fetching files from Elastic Search for dataset {dataset['uuid']}: {e}"
                 )
-                num_errors = 0
+                num_errors += 1
                 continue
 
-            # delete files in elastic search that are not in the local database
+            # Phase 1: delete files in elastic search that are not in the local
+            # database. The delete set can be very large, so accumulate and flush
+            # in bounded batches rather than holding the whole list in memory.
             diff_es_files = set(es_filepath_map.keys()) - set(local_filepath_map.keys())
             if diff_es_files:
                 logger.info(
-                    f"Deleting {len(diff_es_files)} files from ES for dataset {dataset['uuid']}: "
-                    f"{', '.join(diff_es_files)}"
+                    f"Deleting {len(diff_es_files)} files from ES for dataset {dataset['uuid']}"
                 )
-                es_deletes.extend(
-                    [
-                        {
-                            "dataset_uuid": dataset["uuid"],
-                            "rel_path": filepath,
-                        }
-                        for filepath in diff_es_files
-                    ]
-                )
-
-            for idx, (rel_path, local_file) in enumerate(local_filepath_map.items()):
-                if idx > 0 and idx % 100 == 0:
-                    try:
-                        # keep-alive ping to Neo4j to prevent timeout
-                        neo4j_session.run("RETURN 1")
-                    except Exception as e:
-                        logger.warning(f"Neo4j keep-alive ping failed: {e}")
-
-                # check if the file is in elastic search
-                es_file = es_filepath_map.get(rel_path)
-                needs_upsert = (
-                        es_file is None
-                        or local_file.last_modified_at != es_file["last_modified_at"]
-                        or local_file.size != es_file["size"]
-                )
-                if es_file and es_file.get("file_uuid"):
-                    # something has gone wrong if this happens
-                    logger.warning(
-                        f"File {local_file.rel_path} already has a file_uuid "
-                        f"{es_file['file_uuid']} for dataset {dataset['uuid']} in QA indexing."
-                    )
-
-                if needs_upsert:
-                    # insert or update the file in elastic search
-                    file_ext = os.path.splitext(local_file.path)[1].lower()
-                    additional_info = None
-                    try:
-                        additional_info = file_manager.get_additional_info(
-                            dataset=dataset,
-                            path=rel_path,
+                with TimedStep(logger, f"Delete loop for dataset {dataset['uuid']} ({len(diff_es_files)} files)"):
+                    for filepath in diff_es_files:
+                        es_deletes.append(
+                            {
+                                "dataset_uuid": dataset["uuid"],
+                                "rel_path": filepath,
+                            }
                         )
+
+                        if len(es_deletes) >= FLUSH_ES_DOCS_LEVEL:
+                            try:
+                                logger.info(
+                                    f"Flushing {len(es_deletes)} deletes to ES "
+                                    f"(mid-dataset flush for dataset {dataset['uuid']})"
+                                )
+                                with TimedStep(logger, f"ES bulk delete {len(es_deletes)} docs (mid-dataset flush)"):
+                                    err_msgs = bulk_update_es_indices(
+                                        indices=es_indices, upserts=[], deletes=es_deletes
+                                    )
+                                if err_msgs:
+                                    for msg in err_msgs:
+                                        logger.error(f"Error deleting document: {msg}")
+                                es_deletes = []
+                            except Exception as e:
+                                logger.error(
+                                    f"Error flushing deletes to ES for dataset {dataset['uuid']}: {e}"
+                                )
+                                num_errors += 1
+
+                # flush any remaining deletes below the threshold
+                if es_deletes:
+                    try:
+                        with TimedStep(logger, f"ES bulk delete {len(es_deletes)} docs (delete remainder)"):
+                            err_msgs = bulk_update_es_indices(
+                                indices=es_indices, upserts=[], deletes=es_deletes
+                            )
+                        if err_msgs:
+                            for msg in err_msgs:
+                                logger.error(f"Error deleting document: {msg}")
+                        es_deletes = []
                     except Exception as e:
-                        logger.error(
-                            f"Error fetching file description for {local_file.rel_path} in dataset "
-                            f"{dataset['uuid']}: {e}"
-                        )
+                        logger.error(f"Error flushing remaining deletes for dataset {dataset['uuid']}: {e}")
                         num_errors += 1
 
-                    logger.info(
-                        f"Buffering ES Document for upsert for file {local_file.rel_path} in Dataset {dataset['uuid']}"
+            # Phase 2: upsert files from the local database. Flush in bounded batches
+            # to keep memory flat for datasets with very large file counts.
+            with TimedStep(logger, f"Build upserts loop for dataset {dataset['uuid']} ({len(local_filepath_map)} files)"):
+                for idx, (rel_path, local_file) in enumerate(local_filepath_map.items()):
+                    if idx > 0 and idx % 100 == 0:
+                        try:
+                            # keep-alive ping to Neo4j to prevent timeout
+                            neo4j_session.run("RETURN 1")
+                        except Exception as e:
+                            logger.warning(f"Neo4j keep-alive ping failed: {e}")
+
+                    # check if the file is in elastic search
+                    es_file = es_filepath_map.get(rel_path)
+                    needs_upsert = (
+                            es_file is None
+                            or local_file.last_modified_at != es_file["last_modified_at"]
+                            or local_file.size != es_file["size"]
                     )
-                    doc = {
-                        "dataset_uuid": dataset["uuid"],
-                        "dataset_hubmap_id": dataset["hubmap_id"],
-                        "dataset_status": dataset["status"],
-                        "dataset_type": dataset["dataset_type"],
-                        "data_access_level": dataset["data_access_level"],
-                        "file_extension": file_ext,
-                        "organs": organs,
-                        "rel_path": rel_path,
-                        "size": local_file.size,
-                        "donors": dataset["donors"],
-                        "last_modified_at": local_file.last_modified_at,
-                    }
-                    if additional_info is not None:
-                        doc.update(additional_info)
+                    if es_file and es_file.get("file_uuid"):
+                        # something has gone wrong if this happens
+                        logger.warning(
+                            f"File {local_file.rel_path} already has a file_uuid "
+                            f"{es_file['file_uuid']} for dataset {dataset['uuid']} in QA indexing."
+                        )
 
-                    es_upserts.append(doc)
+                    if needs_upsert:
+                        # insert or update the file in elastic search
+                        file_ext = os.path.splitext(local_file.path)[1].lower()
+                        additional_info = None
+                        try:
+                            with TimedStep(logger, f"get_additional_info for {rel_path} in dataset {dataset['uuid']}"):
+                                additional_info = file_manager.get_additional_info(
+                                    dataset=dataset,
+                                    path=rel_path,
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"Error fetching file description for {local_file.rel_path} in dataset "
+                                f"{dataset['uuid']}: {e}"
+                            )
+                            num_errors += 1
 
-            # bulk update elastic search indices if necessary
-            if es_upserts or es_deletes:
+                        logger.info(
+                            f"Buffering ES Document for upsert for file {local_file.rel_path} in Dataset {dataset['uuid']}"
+                        )
+                        doc = {
+                            "dataset_uuid": dataset["uuid"],
+                            "dataset_hubmap_id": dataset["hubmap_id"],
+                            "dataset_status": dataset["status"],
+                            "dataset_type": dataset["dataset_type"],
+                            "data_access_level": dataset["data_access_level"],
+                            "file_extension": file_ext,
+                            "organs": organs,
+                            "rel_path": rel_path,
+                            "size": local_file.size,
+                            "donors": dataset["donors"],
+                            "last_modified_at": local_file.last_modified_at,
+                        }
+                        if additional_info is not None:
+                            doc.update(additional_info)
+
+                        es_upserts.append(doc)
+
+                    if len(es_upserts) >= FLUSH_ES_DOCS_LEVEL:
+                        try:
+                            logger.info(
+                                f"Flushing {len(es_upserts)} upserts to ES "
+                                f"(mid-dataset flush at file {idx + 1} of {len(local_filepath_map)} "
+                                f"for dataset {dataset['uuid']})"
+                            )
+                            with TimedStep(logger, f"ES bulk upsert {len(es_upserts)} docs (mid-dataset flush)"):
+                                err_msgs = bulk_update_es_indices(
+                                    indices=es_indices, upserts=es_upserts, deletes=[]
+                                )
+                            if err_msgs:
+                                for msg in err_msgs:
+                                    logger.error(f"Error indexing document: {msg}")
+                            es_upserts = []
+                        except Exception as e:
+                            logger.error(
+                                f"Error flushing upserts to ES for dataset {dataset['uuid']}: {e}"
+                            )
+                            num_errors += 1
+
+            # flush any remaining upserts below the threshold
+            if es_upserts:
                 try:
-                    err_msgs = bulk_update_es_indices(
-                        indices=es_indices, upserts=es_upserts, deletes=es_deletes
-                    )
+                    with TimedStep(logger, f"ES bulk upsert {len(es_upserts)} docs (upsert remainder)"):
+                        err_msgs = bulk_update_es_indices(
+                            indices=es_indices, upserts=es_upserts, deletes=[]
+                        )
                     if err_msgs:
                         for msg in err_msgs:
                             logger.error(f"Error indexing document: {msg}")
+                    es_upserts = []
                 except Exception as e:
                     logger.error(f"Error indexing documents for dataset {dataset['uuid']}: {e}")
-                    num_errors = 0
+                    num_errors += 1
 
     return dataset_uuids, num_errors
 
 
 def main():
-
     msg = f"{util_config['SLACK_NEUTRAL_INFO_EMOJI']}" \
-          f" The {Path(__file__).name} process is launching to fill" \
-          f" ElasticSearch indices {config.elastic_search_public_index} and {config.elastic_search_private_index}."
+          f" The {Path(__file__).name} process is launching to maintain" \
+          f" ElasticSearch indices {config.elastic_search_public_index}" \
+          f" and {config.elastic_search_private_index}"
     logger.info(msg)
     service_utils.postToSlackChannel(channel=util_config['SLACK_NOTIFICATION_CHANNEL']
                                      , msg=msg)
@@ -879,8 +1060,9 @@ def main():
 
     if config.slack_notifications != 'DISABLED':
         if num_errors > 0:
-            err_msg =   f"{num_errors} errors occurred during {config.log_id} " \
-                        f" Elastic Search file indexing." \
+            err_msg =   f"ElasticSearch {config.log_id} maintenance file indexing" \
+                        f" by {Path(__file__).name}" \
+                        f" completed with {num_errors} errors." \
                         f" See {log_file_name}." \
                         f"{util_config['SLACK_BAD_NEWS_EMOJI']}"
             service_utils.exit_if_halt_reason(halt_reasons=[err_msg]
@@ -889,7 +1071,9 @@ def main():
                                               , process_bad_news_emoji=':bangbang:'
                                               , exit_code=2)
         else:
-            success_msg = f"ElasticSearch {config.log_id} file indexing completed successfully." \
+            success_msg = f"ElasticSearch {config.log_id}" \
+                          f" maintenance file indexing by {Path(__file__).name}" \
+                          f" completed successfully." \
                           f"{util_config['SLACK_GOOD_NEWS_EMOJI']}"
             service_utils.postToSlackChannel(channel=util_config['SLACK_NOTIFICATION_CHANNEL']
                                      , msg=success_msg
