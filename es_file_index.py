@@ -77,6 +77,11 @@ FLUSH_ES_DOCS_LEVEL = 1000
 # per Bulk API call, to stay within request size limits.
 FLUSH_ES_DOCS_CHUNK_SIZE = 100
 
+# Small pause inserted before each per-dataset UUID API fetch to space out requests
+# to the UUID API. This replaces an inherited blanket time.sleep(1) per dataset, which
+# at ~18k datasets cost ~5 hours per run. Set to 0 (or comment the sleep) to disable.
+UUID_API_PER_DATASET_PAUSE = 0.05
+
 # Cypher query base for HuBMAP datasets.
 # ds.metadata and ds.files are returned as raw strings rather than parsed via APOC
 # to avoid Neo.ClientError.Procedure.ProcedureCallFailed errors from invalid JSON
@@ -293,7 +298,9 @@ def get_docs_from_es(index: str, dataset_uuid: str, fields: List[str]) -> List[d
                 for hit in hits
             )
             scroll_id = scroll_data["_scroll_id"]
-            time.sleep(1)
+            # Spacer between scroll pages, reduced from 1s. Aggregate cost is captured
+            # within the enclosing "ES scroll search" TimedStep.
+            time.sleep(0.5)
 
     return docs
 
@@ -473,7 +480,6 @@ def index_published_datasets(
                 num_errors += 1
                 continue
 
-            time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
             logger.info(f"Processing Dataset {dataset['uuid']}")
 
@@ -511,6 +517,10 @@ def index_published_datasets(
 
             try:
                 # get files in uuid-api for the dataset
+                # Tiny spacer before the UUID API call to avoid hammering it across
+                # thousands of datasets. Timed so its aggregate cost is visible.
+                with TimedStep(logger, f"UUID API pause for dataset {dataset['uuid']}", threshold=0.0):
+                    time.sleep(UUID_API_PER_DATASET_PAUSE)
                 with TimedStep(logger, f"UUID API fetch for dataset {dataset['uuid']}"):
                     uuid_filepath_map = {
                         item["path"]: item
@@ -767,7 +777,6 @@ def index_qa_datasets(ubkg_organs: dict, driver: Driver, db: Database) -> Tuple[
                 num_errors += 1
                 continue
 
-            time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
             logger.info(f"Processing Dataset {dataset['uuid']}")
 

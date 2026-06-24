@@ -21,7 +21,6 @@ import time
 from argparse import ArgumentParser
 from collections import namedtuple
 from configparser import ConfigParser
-from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -38,6 +37,7 @@ from urllib3.util.retry import Retry
 from database import Database, DBFilePart
 from file_manager import FileManager
 from file_indexing_utils import FileIndexingUtils
+from timed_step import TimedStep
 
 Config = namedtuple(
     "Config",
@@ -76,6 +76,10 @@ FLUSH_ES_DOCS_LEVEL = 1000
 # The task of flushing es_inserts to ElasticSearch when FLUSH_ES_DOCS_LEVEL is reached
 # is performed in chunks with this many documents per Bulk API call.
 FLUSH_ES_DOCS_CHUNK_SIZE = 100
+
+# Small pause before each per-dataset UUID API fetch to space out requests to the
+# UUID API. Replaces an inherited blanket time.sleep(1) per dataset. Set to 0 to disable.
+UUID_API_PER_DATASET_PAUSE = 0.05
 
 # Partition settings - controls which subset of datasets this instance processes.
 # PARTITION_KEY is set by --partition-key argument validated against PARTITION_CHAR_SPANS.
@@ -142,7 +146,7 @@ def fetch_datasets(statuses: List[str]) -> List[dict]:
     auth = (config.neo4j_username, config.neo4j_password)
     datasets = []
     ping_count = 0
-    with timed_step(f"Neo4j fetch_datasets for statuses {statuses}"):
+    with TimedStep(logger, f"Neo4j fetch_datasets for statuses {statuses}"):
         with GraphDatabase.driver(config.neo4j_uri, auth=auth) as neo4j_driver:
             with neo4j_driver.session() as neo4j_session:
                 result = neo4j_session.run(build_datasets_query(), statuses=statuses)
@@ -244,15 +248,7 @@ def setup_logger(log_id: str, log_level: str):
 TIMEOUT = 30  # seconds
 
 
-@contextmanager
-def timed_step(label: str):
-    """Context manager for timing suspect steps. Logs at INFO level if the step
-    takes more than 0.1 seconds, so routine fast calls stay out of the log."""
-    start = time.time()
-    yield
-    elapsed = time.time() - start
-    if elapsed > 0.1:
-        logger.info(f"TIMING: {label} took {elapsed:.2f}s")
+
 
 
 config = parse_config()
@@ -518,7 +514,6 @@ def index_published_datasets(
                 logger.info(f"Skipping dataset {dataset['uuid']} - does not end with one of {sorted(PARTITION_CHAR_SPANS[PARTITION_KEY])}.")
                 continue
 
-            time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
             logger.info(f"Processing Dataset {dataset['uuid']}")
 
@@ -537,7 +532,7 @@ def index_published_datasets(
             try:
                 # get files in local database for the dataset, filter out files with blank or
                 # numeric extensions
-                with timed_step(f"SQLite query_files_part for dataset {dataset['uuid']}"):
+                with TimedStep(logger, f"SQLite query_files_part for dataset {dataset['uuid']}"):
                     local_filepath_map = {
                         file.rel_path: file
                         for file in db.query_files_part(dataset_globus_path, PARTITION_CLAUSES[PARTITION_KEY])
@@ -551,7 +546,11 @@ def index_published_datasets(
                 continue
 
             try:
-                with timed_step(f"UUID API fetch for dataset {dataset['uuid']}"):
+                # Tiny spacer before the UUID API call to avoid hammering it across
+                # the partition's datasets.
+                with TimedStep(logger, f"UUID API pause for dataset {dataset['uuid']}", threshold=0.0):
+                    time.sleep(UUID_API_PER_DATASET_PAUSE)
+                with TimedStep(logger, f"UUID API fetch for dataset {dataset['uuid']}"):
                     uuid_filepath_map = {
                         item["path"]: item
                         for item in get_files_from_uuid_api(dataset_uuid=dataset["uuid"])
@@ -612,7 +611,7 @@ def index_published_datasets(
             dataset_additional_info = None
             if local_filepath_map:
                 try:
-                    with timed_step(f"get_additional_info for dataset {dataset['uuid']}"):
+                    with TimedStep(logger, f"get_additional_info for dataset {dataset['uuid']}"):
                         dataset_additional_info = file_manager.get_additional_info(
                             dataset=dataset,
                             path=next(iter(local_filepath_map)),
@@ -667,7 +666,7 @@ def index_published_datasets(
                             f"(mid-dataset flush at file {idx + 1} of {len(local_filepath_map)} "
                             f"for dataset {dataset['uuid']})"
                         )
-                        with timed_step(f"ES bulk insert {len(es_inserts)} docs (mid-dataset flush)"):
+                        with TimedStep(logger, f"ES bulk insert {len(es_inserts)} docs (mid-dataset flush)"):
                             err_msgs = bulk_insert_es_indices(
                                 indices=es_indices, upserts=es_inserts
                             )
@@ -695,7 +694,7 @@ def index_published_datasets(
                         f"Flushing {len(es_inserts)} remaining inserts "
                         f"to ES for dataset {dataset['uuid']}"
                     )
-                    with timed_step(f"ES bulk insert {len(es_inserts)} docs (end-of-dataset flush)"):
+                    with TimedStep(logger, f"ES bulk insert {len(es_inserts)} docs (end-of-dataset flush)"):
                         err_msgs = bulk_insert_es_indices(
                             indices=es_indices, upserts=es_inserts
                         )
@@ -740,7 +739,6 @@ def index_qa_datasets(
                 logger.info(f"Skipping dataset {dataset['uuid']} - does not end with one of {sorted(PARTITION_CHAR_SPANS[PARTITION_KEY])}.")
                 continue
 
-            time.sleep(1)
             dataset_uuids.append(dataset["uuid"])
             logger.info(f"Processing Dataset {dataset['uuid']}")
 
@@ -757,7 +755,7 @@ def index_qa_datasets(
 
             dataset_globus_path = get_dataset_globus_path(dataset)
             try:
-                with timed_step(f"SQLite query_files_part for dataset {dataset['uuid']}"):
+                with TimedStep(logger, f"SQLite query_files_part for dataset {dataset['uuid']}"):
                     local_filepath_map = {
                         file.rel_path: file
                         for file in db.query_files_part(dataset_globus_path, PARTITION_CLAUSES[PARTITION_KEY])
@@ -773,7 +771,7 @@ def index_qa_datasets(
             dataset_additional_info = None
             if local_filepath_map:
                 try:
-                    with timed_step(f"get_additional_info for dataset {dataset['uuid']}"):
+                    with TimedStep(logger, f"get_additional_info for dataset {dataset['uuid']}"):
                         dataset_additional_info = file_manager.get_additional_info(
                             dataset=dataset,
                             path=next(iter(local_filepath_map)),
@@ -824,7 +822,7 @@ def index_qa_datasets(
                             f"(mid-dataset flush at file {idx + 1} of {len(local_filepath_map)} "
                             f"for dataset {dataset['uuid']})"
                         )
-                        with timed_step(f"ES bulk insert {len(es_inserts)} docs (mid-dataset flush)"):
+                        with TimedStep(logger, f"ES bulk insert {len(es_inserts)} docs (mid-dataset flush)"):
                             err_msgs = bulk_insert_es_indices(
                                 indices=es_indices, upserts=es_inserts
                             )
@@ -852,7 +850,7 @@ def index_qa_datasets(
                         f"Flushing {len(es_inserts)} remaining inserts "
                         f"to ES for dataset {dataset['uuid']}"
                     )
-                    with timed_step(f"ES bulk insert {len(es_inserts)} docs (end-of-dataset flush)"):
+                    with TimedStep(logger, f"ES bulk insert {len(es_inserts)} docs (end-of-dataset flush)"):
                         err_msgs = bulk_insert_es_indices(
                             indices=es_indices, upserts=es_inserts
                         )
