@@ -259,48 +259,51 @@ def get_dataset_globus_path(dataset: Record) -> str:
 
 
 def get_docs_from_es(index: str, dataset_uuid: str, fields: List[str]) -> List[dict]:
-    scroll = "1m"  # save scroll context for 1 minute
+    # Read all ES docs for one dataset using stateless search_after pagination
+    # rather than the Scroll API. Scroll opens a server-side context per call; doing
+    # that once per dataset (~18k/run) against a small managed domain exhausted its
+    # scroll-context capacity and produced sustained HTTP 429 (Too Many Requests).
+    #
+    # search_after needs no server-side context. We sort by rel_path.keyword, which is
+    # a valid total order here because every query is filtered to a single dataset_uuid,
+    # making rel_path unique within the result set. Most datasets fit in one page, so
+    # the common case is a single request with no pagination round-trips.
+    #
+    # The term targets dataset_uuid.keyword (the exact-match keyword sub-field) rather
+    # than the analyzed text field, which is the correct field for an exact term match.
     size = 10000
     docs = []
-
-    # initial search with scroll and get id
-    search_url = f"{config.elastic_search_url}/{index}/_search?scroll={scroll}"
-    query = {
+    search_url = f"{config.elastic_search_url}/{index}/_search"
+    base_query = {
         "_source": fields,
         "size": size,
-        "query": {"term": {"dataset_uuid": dataset_uuid}},
+        "query": {"term": {"dataset_uuid.keyword": dataset_uuid}},
+        "sort": [{"rel_path.keyword": "asc"}],
     }
-    with TimedStep(logger, f"ES scroll search for dataset {dataset_uuid} in {index}"):
-        res = session.post(search_url, json=query, timeout=TIMEOUT)
-        res.raise_for_status()
-        data = res.json()
-        scroll_id = data["_scroll_id"]
-        hits = data["hits"]["hits"]
-        docs.extend(
-            {"_id": hit["_id"], **{field: hit["_source"].get(field) for field in fields}}
-            for hit in hits
-        )
 
-        # scroll until no more hits
-        while hits:
-            scroll_resp = session.post(
-                f"{config.elastic_search_url}/_search/scroll",
-                json={"scroll": scroll, "scroll_id": scroll_id},
-                timeout=TIMEOUT,
-            )
-            scroll_resp.raise_for_status()
-            scroll_data = scroll_resp.json()
-            hits = scroll_data["hits"]["hits"]
+    with TimedStep(logger, f"ES search_after for dataset {dataset_uuid} in {index}"):
+        search_after = None
+        while True:
+            # Copy the base_query and add on search_after if
+            # it is set during the previous iteration of the loop.
+            query = dict(base_query)
+            if search_after is not None:
+                query["search_after"] = search_after
+            res = session.post(search_url, json=query, timeout=TIMEOUT)
+            res.raise_for_status()
+            hits = res.json()["hits"]["hits"]
             if not hits:
                 break
             docs.extend(
                 {"_id": hit["_id"], **{field: hit["_source"].get(field) for field in fields}}
                 for hit in hits
             )
-            scroll_id = scroll_data["_scroll_id"]
-            # Spacer between scroll pages, reduced from 1s. Aggregate cost is captured
-            # within the enclosing "ES scroll search" TimedStep.
-            time.sleep(0.5)
+            # Fewer than a full page means this was the last page.
+            if len(hits) < size:
+                break
+            # Page again from the sort value of the last hit. No server-side context,
+            # so no scroll-id to carry and no inter-page pause needed.
+            search_after = hits[-1]["sort"]
 
     return docs
 
